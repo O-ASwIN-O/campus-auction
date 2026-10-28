@@ -160,11 +160,11 @@ async function fetchListings({ mode = "active", sellerId } = {}) {
     auctionQuery = auctionQuery
       .eq("status", "published")
       .gt("closes_at", new Date().toISOString());
-  } else if (mode === "cancelled") {
-    auctionQuery = auctionQuery.eq("status", "cancelled");
   } else if (mode === "seller") {
     if (!sellerId) throw new Error("Sign in to load your listings.");
-    auctionQuery = auctionQuery.eq("seller_id", sellerId);
+    auctionQuery = auctionQuery
+      .eq("seller_id", sellerId)
+      .neq("status", "cancelled");
   } else {
     throw new Error("Unsupported auction listing query.");
   }
@@ -454,12 +454,9 @@ function App() {
         .in("id", auctionIds);
 
       if (page === "my-listings" && currentUserId) {
-        currentAuctionsQuery = currentAuctionsQuery.eq(
-          "seller_id",
-          currentUserId,
-        );
-      } else if (page === "cancelled-history") {
-        currentAuctionsQuery = currentAuctionsQuery.eq("status", "cancelled");
+        currentAuctionsQuery = currentAuctionsQuery
+          .eq("seller_id", currentUserId)
+          .neq("status", "cancelled");
       } else {
         currentAuctionsQuery = currentAuctionsQuery
           .eq("status", "published")
@@ -669,11 +666,9 @@ function App() {
     const listingMode =
       nextPage === "my-listings"
         ? "seller"
-        : nextPage === "cancelled-history"
-          ? "cancelled"
-          : ["home", "browse"].includes(nextPage)
-            ? "active"
-            : null;
+        : ["home", "browse"].includes(nextPage)
+          ? "active"
+          : null;
     if (listingMode) {
       void refreshListings(listingMode);
     } else {
@@ -1266,7 +1261,7 @@ function App() {
 
     if (
       !window.confirm(
-        `Cancel "${item.title}"?\n\nThis immediately ends the auction and invalidates its result. Existing bids will remain in the public history, and all bidders will be notified. This cannot be undone.`,
+        `Cancel "${item.title}"?\n\nThis immediately ends the auction and invalidates its result. Bidders will be notified, and bid/notification records are retained for 24 hours. The cancelled auction and its bids will then be permanently deleted. This cannot be undone.`,
       )
     ) {
       return;
@@ -1290,20 +1285,14 @@ function App() {
       setCancellingAuctionId(null);
     }
 
-    setItems((previous) =>
-      previous.map((entry) =>
-        entry.id === itemId
-          ? { ...entry, status: "CANCELLED" }
-          : entry,
-      ),
-    );
+    setItems((previous) => previous.filter((entry) => entry.id !== itemId));
     setSelectedItem((previous) =>
-      previous?.id === itemId ? { ...previous, status: "CANCELLED" } : previous,
+      previous?.id === itemId ? null : previous,
     );
     flash(
       item.bids.length
-        ? "Auction cancelled. Bid history is preserved and bidders have been notified."
-        : "Your auction has been cancelled.",
+        ? "Auction cancelled. Bidders were notified; the auction and bids will be permanently removed after 24 hours."
+        : "Auction cancelled. It will be permanently removed after 24 hours.",
     );
   }
 
@@ -1324,6 +1313,10 @@ function App() {
       );
       if (beginError) throw beginError;
       deletionStarted = true;
+      setItems((previous) => previous.filter((entry) => entry.id !== item.id));
+      setSelectedItem((previous) =>
+        previous?.id === item.id ? { ...previous, status: "CANCELLED" } : previous,
+      );
 
       const paths = photoPaths || [];
       const filesByFolder = new Map();
@@ -1377,13 +1370,7 @@ function App() {
       flash("Listing and its photos were deleted.");
 
       try {
-        await refreshListings(
-          page === "my-listings"
-            ? "seller"
-            : page === "cancelled-history"
-              ? "cancelled"
-              : "active",
-        );
+        await refreshListings(page === "my-listings" ? "seller" : "active");
       } catch (refreshError) {
         console.error("Listing deleted, but refreshing auctions failed.", refreshError);
         flash("Listing deleted, but the latest auctions could not be refreshed.");
@@ -1450,7 +1437,10 @@ function App() {
   const sellerItems =
     itemsLoading || itemsError
       ? []
-      : items.filter((item) => item.sellerId === user?.id);
+      : items.filter(
+          (item) =>
+            item.sellerId === user?.id && item.status !== "CANCELLED",
+        );
 
   const isSelectedAuctionOwner = Boolean(
     user &&
@@ -1493,9 +1483,6 @@ function App() {
 
         <nav className="nav-links">
           <NavButton onClick={() => go("browse")}>Buy items</NavButton>
-          <NavButton onClick={() => go("cancelled-history")}>
-            Cancelled history
-          </NavButton>
           <NavButton onClick={() => user ? go("sell") : requestLogin("sell")}>
             Sell items
           </NavButton>
@@ -1782,49 +1769,6 @@ function App() {
                 <span>🔎</span>
                 <h3>No active auctions match</h3>
                 <p>Try changing your search or filters.</p>
-              </div>
-            )}
-          </section>
-        )}
-
-        {page === "cancelled-history" && (
-          <section className="marketplace page-section">
-            <div className="section-heading">
-              <div>
-                <span className="eyebrow">PUBLIC RECORD</span>
-                <h1>Cancelled Auction History</h1>
-                <p className="subheading">
-                  Cancelled auctions are not open for bidding. Existing bid
-                  records remain available for review.
-                </p>
-              </div>
-              <button className="secondary-button" onClick={() => go("browse")}>
-                Back to active auctions
-              </button>
-            </div>
-            {itemsLoading ? (
-              <p className="results-count">Loading cancelled auction history...</p>
-            ) : itemsError ? (
-              <div className="empty-state" role="alert">
-                <h3>History is unavailable</h3>
-                <p>{itemsError}</p>
-              </div>
-            ) : items.length === 0 ? (
-              <div className="empty-state">
-                <h3>No cancelled auctions</h3>
-                <p>Cancelled listings will appear here for recordkeeping.</p>
-              </div>
-            ) : (
-              <div className="product-grid">
-                {items.map((item) => (
-                  <ProductCard
-                    key={item.id}
-                    item={item}
-                    now={now}
-                    countdown={countdown}
-                    onOpen={() => openItem(item)}
-                  />
-                ))}
               </div>
             )}
           </section>
