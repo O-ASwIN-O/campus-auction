@@ -54,7 +54,52 @@ function mapBid(row) {
     amount: Number(row.amount),
     createdAt: row.created_at,
     bidderName: "Campus bidder",
+    auctionStatus: row.auction_status,
   };
+}
+
+function getPasswordResetError(error, isUpdatingPassword = false) {
+  const code = String(error?.code || "").toLowerCase();
+  const message = String(error?.message || "").toLowerCase();
+  const status = Number(error?.status);
+  const invalidResetLink =
+    code.includes("expired") ||
+    code.includes("token") ||
+    code.includes("otp") ||
+    message.includes("expired") ||
+    message.includes("token") ||
+    message.includes("reset link is invalid");
+
+  if (
+    status === 429 ||
+    code.includes("rate") ||
+    message.includes("rate limit") ||
+    message.includes("too many requests")
+  ) {
+    return "Too many password reset requests. Please wait a while before trying again.";
+  }
+
+  if (
+    isUpdatingPassword &&
+    (code.includes("weak_password") ||
+      message.includes("password") ||
+      message.includes("at least")) &&
+    !invalidResetLink
+  ) {
+    return "The new password does not meet the password requirements. Choose a stronger password and try again.";
+  }
+
+  if (invalidResetLink) {
+    return "This password reset link is invalid or has expired. Request a new one.";
+  }
+
+  if (code.includes("redirect") || message.includes("redirect")) {
+    return "The reset link could not be sent because its redirect URL is not allowed. Check the Supabase Auth URL configuration.";
+  }
+
+  return isUpdatingPassword
+    ? "The password could not be updated. The reset link may have expired; request a new one if needed."
+    : "The reset email could not be sent. Please check the address and try again later.";
 }
 
 async function createPhotoUrlMap(paths) {
@@ -114,7 +159,7 @@ async function fetchListings() {
   const [bidsResult, profilesResult, photoUrlsByPath] = await Promise.all([
     supabase
       .from("public_bid_history")
-      .select("bid_id, auction_id, amount, created_at")
+      .select("bid_id, auction_id, amount, created_at, auction_status")
       .in("auction_id", auctionIds)
       .order("created_at", { ascending: false }),
     supabase
@@ -159,13 +204,37 @@ function NavButton({ children, onClick, className = "", disabled = false }) {
 }
 
 function App() {
-  const [page, setPage] = useState("home");
+  const [page, setPage] = useState(() =>
+    window.location.pathname.replace(/\/+$/, "") === "/reset-password"
+      ? "reset-password"
+      : "home",
+  );
   const [items, setItems] = useState([]);
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
   const [authMode, setAuthMode] = useState("signin");
   const [authError, setAuthError] = useState("");
+  const [passwordResetEmail, setPasswordResetEmail] = useState("");
+  const [passwordResetError, setPasswordResetError] = useState(() => {
+    const resetRoute =
+      window.location.pathname.replace(/\/+$/, "") === "/reset-password";
+    const hasResetUrlError = ["error", "error_code", "error_description"].some(
+      (key) =>
+        new URLSearchParams(window.location.search).has(key) ||
+        new URLSearchParams(window.location.hash.slice(1)).has(key),
+    );
+    return resetRoute && hasResetUrlError
+      ? "This password reset link is invalid or has expired. Request a new one."
+      : "";
+  });
+  const [passwordResetMessage, setPasswordResetMessage] = useState("");
+  const [passwordResetBusy, setPasswordResetBusy] = useState(false);
+  const [passwordResetSessionReady, setPasswordResetSessionReady] = useState(false);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [resetPasswordVisible, setResetPasswordVisible] = useState(false);
+  const [confirmResetPasswordVisible, setConfirmResetPasswordVisible] = useState(false);
   const [itemsLoading, setItemsLoading] = useState(true);
   const [itemsError, setItemsError] = useState("");
   const [authIntent, setAuthIntent] = useState("buy");
@@ -174,6 +243,8 @@ function App() {
   const [bidBusy, setBidBusy] = useState(false);
   const [listingBusy, setListingBusy] = useState(false);
   const [photoFiles, setPhotoFiles] = useState([]);
+  const [replacementPhotoFiles, setReplacementPhotoFiles] = useState([]);
+  const [replacementPhotosBusy, setReplacementPhotosBusy] = useState(false);
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All");
   const [condition, setCondition] = useState("All");
@@ -187,6 +258,7 @@ function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [deletingAuctionId, setDeletingAuctionId] = useState(null);
+  const [cancellingAuctionId, setCancellingAuctionId] = useState(null);
   const [deletionPendingIds, setDeletionPendingIds] = useState(() => new Set());
   const currentUserId = user?.id;
   const photoPreviews = useMemo(
@@ -213,10 +285,24 @@ function App() {
 
   useEffect(() => {
     let active = true;
+    const resetRoute =
+      window.location.pathname.replace(/\/+$/, "") === "/reset-password";
+    const hasResetUrlError = ["error", "error_code", "error_description"].some(
+      (key) =>
+        new URLSearchParams(window.location.search).has(key) ||
+        new URLSearchParams(window.location.hash.slice(1)).has(key),
+    );
+
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (active) setUser(session?.user || null);
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!active) return;
+      setUser(session?.user || null);
+      if (event === "PASSWORD_RECOVERY" && session) {
+        setPage("reset-password");
+        setPasswordResetSessionReady(true);
+        setPasswordResetError("");
+      }
     });
 
     supabase.auth
@@ -224,15 +310,24 @@ function App() {
       .then(({ data, error }) => {
         if (!active) return;
         if (error) {
-          console.error("Could not restore the Supabase session.", error);
+          console.error("Could not restore the Supabase session.");
           flash("Could not restore your sign-in. Please sign in again.");
         }
         setUser(data.session?.user || null);
+        if (resetRoute && !hasResetUrlError && data.session) {
+          setPasswordResetSessionReady(true);
+          setPasswordResetError("");
+        } else if (resetRoute && !hasResetUrlError) {
+          setPasswordResetSessionReady(false);
+          setPasswordResetError(
+            "This password reset link is invalid or has expired. Request a new one.",
+          );
+        }
         setAuthLoading(false);
       })
-      .catch((error) => {
+      .catch(() => {
         if (!active) return;
-        console.error("Could not restore the Supabase session.", error);
+        console.error("Could not restore the Supabase session.");
         setAuthLoading(false);
         flash("Could not restore your sign-in. Please sign in again.");
       });
@@ -295,13 +390,66 @@ function App() {
   }, [currentUserId]);
 
   useEffect(() => {
+    let active = true;
+    let noticeTimeout;
+
+    if (!currentUserId) return undefined;
+
+    async function loadCancellationNotices() {
+      const { data, error } = await supabase
+        .from("notifications")
+        .select("id, message")
+        .eq("notification_type", "auction_cancelled")
+        .eq("is_read", false)
+        .order("created_at", { ascending: false })
+        .limit(25);
+
+      if (!active) return;
+      if (error) {
+        console.error("Could not load auction cancellation notifications.", error);
+        return;
+      }
+      if (!data?.length) return;
+
+      setNotice(
+        data.length === 1
+          ? data[0].message
+          : `${data.length} auctions you bid on were cancelled. Your bid history is preserved.`,
+      );
+      clearTimeout(noticeTimeout);
+      noticeTimeout = setTimeout(() => {
+        if (active) setNotice("");
+      }, 5000);
+
+      const { error: updateError } = await supabase
+        .from("notifications")
+        .update({ is_read: true })
+        .in("id", data.map((notification) => notification.id));
+      if (updateError) {
+        console.error("Could not mark cancellation notifications as read.", updateError);
+      }
+    }
+
+    void loadCancellationNotices();
+    const interval = setInterval(() => {
+      void loadCancellationNotices();
+    }, 30000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+      clearTimeout(noticeTimeout);
+    };
+  }, [currentUserId]);
+
+  useEffect(() => {
     const auctionId = selectedItem?.id;
     if (!auctionId) return undefined;
     let active = true;
 
     supabase
       .from("public_bid_history")
-      .select("bid_id, auction_id, amount, created_at")
+      .select("bid_id, auction_id, amount, created_at, auction_status")
       .eq("auction_id", auctionId)
       .order("created_at", { ascending: false })
       .then(({ data, error }) => {
@@ -405,6 +553,88 @@ function App() {
     }
   }
 
+  async function sendPasswordReset(event) {
+    event.preventDefault();
+    setPasswordResetError("");
+    setPasswordResetMessage("");
+
+    const email = passwordResetEmail.trim();
+    if (!email) {
+      setPasswordResetError("Enter the email address for your account.");
+      return;
+    }
+
+    setPasswordResetBusy(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+      if (error) {
+        setPasswordResetError(getPasswordResetError(error));
+        return;
+      }
+
+      setPasswordResetMessage(
+        "If an account exists for that email, a reset link has been sent. Check your inbox and spam folder.",
+      );
+    } catch (error) {
+      setPasswordResetError(getPasswordResetError(error));
+    } finally {
+      setPasswordResetBusy(false);
+    }
+  }
+
+  async function updatePassword(event) {
+    event.preventDefault();
+    setPasswordResetError("");
+    setPasswordResetMessage("");
+
+    if (!passwordResetSessionReady) {
+      setPasswordResetError(
+        "This password reset link is invalid or has expired. Request a new one.",
+      );
+      return;
+    }
+    if (newPassword.length < 6) {
+      setPasswordResetError("Your password must be at least 6 characters long.");
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      setPasswordResetError("The password entries do not match.");
+      return;
+    }
+
+    setPasswordResetBusy(true);
+    try {
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!data.session) {
+        setPasswordResetSessionReady(false);
+        setPasswordResetError(
+          "This password reset link is invalid or has expired. Request a new one.",
+        );
+        return;
+      }
+
+      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      if (error) {
+        setPasswordResetError(getPasswordResetError(error, true));
+        return;
+      }
+
+      setNewPassword("");
+      setConfirmNewPassword("");
+      setPasswordResetSessionReady(false);
+      window.history.replaceState({}, "", "/");
+      go("browse");
+      flash("Your password has been updated successfully.");
+    } catch (error) {
+      setPasswordResetError(getPasswordResetError(error, true));
+    } finally {
+      setPasswordResetBusy(false);
+    }
+  }
+
   async function handleLogout() {
     try {
       const { error } = await supabase.auth.signOut();
@@ -479,7 +709,7 @@ function App() {
     try {
       const { data, error: historyError } = await supabase
         .from("public_bid_history")
-        .select("bid_id, auction_id, amount, created_at")
+        .select("bid_id, auction_id, amount, created_at, auction_status")
         .eq("auction_id", item.id)
         .order("created_at", { ascending: false });
       if (historyError) throw historyError;
@@ -519,6 +749,138 @@ function App() {
     }
 
     setPhotoFiles(files);
+  }
+
+  function handleReplacementPhotoSelection(event) {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length > 5) {
+      flash("Choose no more than five replacement photos.");
+      return;
+    }
+
+    const invalidFile = files.find(
+      (file) =>
+        !allowedPhotoTypes.has(file.type) ||
+        file.size > maxPhotoSize ||
+        file.size === 0,
+    );
+    if (invalidFile) {
+      flash("Use JPG, PNG or WebP photos no larger than 5 MB each.");
+      return;
+    }
+
+    setReplacementPhotoFiles(files);
+  }
+
+  async function replaceListingPhotos(item) {
+    if (replacementPhotosBusy) return;
+    if (!user || item.sellerId !== user.id) {
+      flash("Only the listing owner can replace its photos.");
+      return;
+    }
+    if (
+      item.status !== "PUBLISHED" ||
+      item.bids.length > 0 ||
+      now >= item.endsAt
+    ) {
+      flash("Photos can only be replaced before bidding starts.");
+      return;
+    }
+    if (!replacementPhotoFiles.length) {
+      flash("Choose at least one replacement photo.");
+      return;
+    }
+    if (
+      !window.confirm(
+        `Replace all photos for "${item.title}"? This is available only before any bids are placed.`,
+      )
+    ) {
+      return;
+    }
+
+    setReplacementPhotosBusy(true);
+    const batchId = crypto.randomUUID();
+    const uploadedPaths = [];
+    let listingUpdated = false;
+    try {
+      for (const file of replacementPhotoFiles) {
+        const extension = allowedPhotoTypes.get(file.type);
+        const path = `${user.id}/${batchId}/${crypto.randomUUID()}.${extension}`;
+        const { error } = await supabase.storage
+          .from(photoBucket)
+          .upload(path, file, {
+            cacheControl: "3600",
+            contentType: file.type,
+            upsert: false,
+          });
+        if (error) throw error;
+        uploadedPaths.push(path);
+      }
+
+      const photoUrlsByPath = await createPhotoUrlMap(uploadedPaths);
+      const { error } = await supabase.rpc("update_auction_listing", {
+        p_auction_id: item.id,
+        p_title: item.title,
+        p_description: item.description,
+        p_category: item.category,
+        p_item_condition: item.condition,
+        p_starting_price: item.price,
+        p_min_increment: item.increment,
+        p_closes_at: new Date(item.endsAt).toISOString(),
+        p_photo_paths: uploadedPaths,
+      });
+      if (error) throw error;
+      listingUpdated = true;
+
+      const updatedItem = {
+        ...item,
+        photoPaths: uploadedPaths,
+        photoUrls: uploadedPaths.map((path) => photoUrlsByPath.get(path)),
+      };
+      setItems((previous) =>
+        previous.map((entry) => (entry.id === item.id ? updatedItem : entry)),
+      );
+      setSelectedItem((previous) =>
+        previous?.id === item.id ? updatedItem : previous,
+      );
+      setReplacementPhotoFiles([]);
+
+      if (item.photoPaths.length) {
+        const { error: cleanupError } = await supabase.storage
+          .from(photoBucket)
+          .remove(item.photoPaths);
+        if (cleanupError) {
+          console.error("New photos are saved, but old listing photos could not be removed.", cleanupError);
+          flash("Photos replaced, but old photo files could not be cleaned up. Contact support.");
+          return;
+        }
+      }
+
+      flash("Listing photos replaced.");
+    } catch (error) {
+      console.error("Could not replace listing photos.", error);
+      if (!listingUpdated && uploadedPaths.length) {
+        try {
+          const { error: cleanupError } = await supabase.storage
+            .from(photoBucket)
+            .remove(uploadedPaths);
+          if (cleanupError) {
+            console.error("Could not clean up new photos after the failed replacement.", cleanupError);
+          }
+        } catch (cleanupError) {
+          console.error("Could not request cleanup of the replacement photos.", cleanupError);
+        }
+      }
+      flash(
+        listingUpdated
+          ? "Photos were updated, but old photo cleanup did not finish."
+          : "Photos could not be replaced. The listing was not changed.",
+      );
+    } finally {
+      setReplacementPhotosBusy(false);
+    }
   }
 
   async function createListing(event) {
@@ -666,12 +1028,22 @@ function App() {
   }
 
   async function cancelListing(itemId) {
+    if (cancellingAuctionId) return;
     const item = items.find((entry) => entry.id === itemId);
     if (!item) {
       flash("This listing could not be found.");
       return;
     }
 
+    if (
+      !window.confirm(
+        `Cancel "${item.title}"?\n\nThis immediately ends the auction and invalidates its result. Existing bids will remain in the public history, and all bidders will be notified. This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+
+    setCancellingAuctionId(itemId);
     try {
       const { error } = await supabase.rpc("cancel_auction", {
         p_auction_id: itemId,
@@ -679,8 +1051,14 @@ function App() {
       if (error) throw error;
     } catch (error) {
       console.error("Could not cancel Supabase auction.", error);
-      flash("This listing could not be cancelled. It may have received a bid or expired.");
+      flash(
+        typeof error?.message === "string"
+          ? `This listing could not be cancelled. ${error.message}`
+          : "This listing could not be cancelled. Only its owner can cancel a published auction.",
+      );
       return;
+    } finally {
+      setCancellingAuctionId(null);
     }
 
     setItems((previous) =>
@@ -688,7 +1066,14 @@ function App() {
         entry.id === itemId ? { ...entry, status: "CANCELLED" } : entry,
       ),
     );
-    flash("Your listing has been cancelled.");
+    setSelectedItem((previous) =>
+      previous?.id === itemId ? { ...previous, status: "CANCELLED" } : previous,
+    );
+    flash(
+      item.bids.length
+        ? "Auction cancelled. Bid history is preserved and bidders have been notified."
+        : "Your auction has been cancelled.",
+    );
   }
 
   async function deleteListing(item) {
@@ -818,6 +1203,7 @@ function App() {
       matchesClosing
     );
   });
+  const cancelledItems = items.filter((item) => item.status === "CANCELLED");
 
   const isSelectedAuctionOwner = Boolean(
     user &&
@@ -1043,9 +1429,33 @@ function App() {
             {!itemsLoading && !itemsError && visibleItems.length === 0 && (
               <div className="empty-state">
                 <span>🔎</span>
-                <h3>No matching auctions</h3>
-                <p>Try changing your search or filters.</p>
+                <h3>No active auctions match</h3>
+                <p>Try changing your search or filters. Cancelled auction history is shown below.</p>
               </div>
+            )}
+            {cancelledItems.length > 0 && (
+              <section className="cancelled-auction-history">
+                <div className="section-heading">
+                  <div>
+                    <span className="eyebrow">PUBLIC RECORD</span>
+                    <h2>Cancelled auction history</h2>
+                    <p className="subheading">
+                      Cancelled auctions no longer accept bids. Existing bids remain visible.
+                    </p>
+                  </div>
+                </div>
+                <div className="product-grid">
+                  {cancelledItems.map((item) => (
+                    <ProductCard
+                      key={item.id}
+                      item={item}
+                      now={now}
+                      countdown={countdown}
+                      onOpen={() => openItem(item)}
+                    />
+                  ))}
+                </div>
+              </section>
             )}
           </section>
         )}
@@ -1123,6 +1533,20 @@ function App() {
                   </button>
                 </span>
               </label>
+              {authMode === "signin" && (
+                <button
+                  className="text-button password-reset-link"
+                  type="button"
+                  onClick={() => {
+                    setPasswordResetEmail(loginEmail);
+                    setPasswordResetError("");
+                    setPasswordResetMessage("");
+                    setPage("forgot-password");
+                  }}
+                >
+                  Forgot password?
+                </button>
+              )}
               {authError && (
                 <p className="auth-error" role="alert">
                   Supabase authentication error: {authError}
@@ -1150,6 +1574,164 @@ function App() {
               </p>
               <button className="text-button back-button" type="button" onClick={() => go("home")}>
                 ← Back to home
+              </button>
+            </form>
+          </section>
+        )}
+
+        {page === "forgot-password" && (
+          <section className="auth-page">
+            <form className="auth-card" onSubmit={sendPasswordReset}>
+              <span className="auth-icon">🔐</span>
+              <span className="eyebrow">ACCOUNT RECOVERY</span>
+              <h1>Reset your password</h1>
+              <p>
+                Enter the email address for your account. If it is registered,
+                Supabase will email you a secure password reset link.
+              </p>
+              <label>
+                Email
+                <input
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={passwordResetEmail}
+                  onChange={(event) => {
+                    setPasswordResetEmail(event.target.value);
+                    setPasswordResetError("");
+                    setPasswordResetMessage("");
+                  }}
+                  placeholder="you@college.edu"
+                />
+              </label>
+              {passwordResetError && (
+                <p className="auth-error" role="alert">{passwordResetError}</p>
+              )}
+              {passwordResetMessage && (
+                <p className="auth-success" role="status">{passwordResetMessage}</p>
+              )}
+              <button
+                className="primary-button full-button"
+                type="submit"
+                disabled={passwordResetBusy}
+              >
+                {passwordResetBusy ? "Sending..." : "Send reset link →"}
+              </button>
+              <button
+                className="text-button back-button"
+                type="button"
+                onClick={() => {
+                  setAuthMode("signin");
+                  setAuthError("");
+                  window.history.replaceState({}, "", "/");
+                  setPage("login");
+                }}
+              >
+                ← Back to sign in
+              </button>
+            </form>
+          </section>
+        )}
+
+        {page === "reset-password" && (
+          <section className="auth-page">
+            <form className="auth-card" onSubmit={updatePassword}>
+              <span className="auth-icon">🔐</span>
+              <span className="eyebrow">ACCOUNT RECOVERY</span>
+              <h1>Choose a new password</h1>
+              <p>Use a password you have not used for this account before.</p>
+              {passwordResetError && (
+                <p className="auth-error" role="alert">{passwordResetError}</p>
+              )}
+              {passwordResetSessionReady ? (
+                <>
+                  <label>
+                    New password
+                    <span className="password-input-wrap">
+                      <input
+                        type={resetPasswordVisible ? "text" : "password"}
+                        autoComplete="new-password"
+                        minLength="6"
+                        required
+                        value={newPassword}
+                        onChange={(event) => {
+                          setNewPassword(event.target.value);
+                          setPasswordResetError("");
+                        }}
+                        placeholder="At least 6 characters"
+                      />
+                      <button
+                        className="password-visibility-toggle"
+                        type="button"
+                        aria-label={resetPasswordVisible ? "Hide new password" : "Show new password"}
+                        aria-pressed={resetPasswordVisible}
+                        onClick={() => setResetPasswordVisible((visible) => !visible)}
+                      >
+                        <EyeIcon visible={resetPasswordVisible} />
+                      </button>
+                    </span>
+                  </label>
+                  <label>
+                    Confirm new password
+                    <span className="password-input-wrap">
+                      <input
+                        type={confirmResetPasswordVisible ? "text" : "password"}
+                        autoComplete="new-password"
+                        minLength="6"
+                        required
+                        value={confirmNewPassword}
+                        onChange={(event) => {
+                          setConfirmNewPassword(event.target.value);
+                          setPasswordResetError("");
+                        }}
+                        placeholder="Re-enter new password"
+                      />
+                      <button
+                        className="password-visibility-toggle"
+                        type="button"
+                        aria-label={confirmResetPasswordVisible ? "Hide confirmation password" : "Show confirmation password"}
+                        aria-pressed={confirmResetPasswordVisible}
+                        onClick={() =>
+                          setConfirmResetPasswordVisible((visible) => !visible)
+                        }
+                      >
+                        <EyeIcon visible={confirmResetPasswordVisible} />
+                      </button>
+                    </span>
+                  </label>
+                  <button
+                    className="primary-button full-button"
+                    type="submit"
+                    disabled={passwordResetBusy}
+                  >
+                    {passwordResetBusy ? "Updating..." : "Update password →"}
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="primary-button full-button"
+                  type="button"
+                  onClick={() => {
+                    setPasswordResetEmail(loginEmail);
+                    setPasswordResetError("");
+                    setPasswordResetMessage("");
+                    window.history.replaceState({}, "", "/");
+                    setPage("forgot-password");
+                  }}
+                >
+                  Request a new reset link
+                </button>
+              )}
+              <button
+                className="text-button back-button"
+                type="button"
+                onClick={() => {
+                  setAuthMode("signin");
+                  window.history.replaceState({}, "", "/");
+                  setPage("login");
+                }}
+              >
+                ← Back to sign in
               </button>
             </form>
           </section>
@@ -1284,9 +1866,15 @@ function App() {
                   />
                   <div className="seller-listing-actions">
                     <span className="status-pill">{item.status.replaceAll("_", " ")}</span>
-                    {item.status === "PUBLISHED" && item.bids.length === 0 && now < item.endsAt && (
-                      <button className="text-button" onClick={() => cancelListing(item.id)}>
-                        Cancel listing
+                    {item.status === "PUBLISHED" && (
+                      <button
+                        className="text-button"
+                        disabled={cancellingAuctionId === item.id}
+                        onClick={() => cancelListing(item.id)}
+                      >
+                        {cancellingAuctionId === item.id
+                          ? "Cancelling..."
+                          : "Cancel auction"}
                       </button>
                     )}
                   </div>
@@ -1340,8 +1928,18 @@ function App() {
               </div>
               <div className="detail-meta">
                 <span>Minimum increment: {money(selectedItem.increment)}</span>
-                <span>Closes in: {countdown(selectedItem.endsAt)}</span>
+                <span>
+                  Closes in: {selectedItem.status === "CANCELLED"
+                    ? "Cancelled"
+                    : countdown(selectedItem.endsAt)}
+                </span>
               </div>
+              {selectedItem.status === "CANCELLED" && (
+                <p className="form-notice cancellation-notice" role="status">
+                  This auction was cancelled by the seller. It is no longer
+                  accepting bids; all recorded bids remain in the public history.
+                </p>
+              )}
 
               <h3>Public bid history</h3>
               {detailLoading ? (
@@ -1393,29 +1991,110 @@ function App() {
                           : "Retry delete listing"}
                       </button>
                     </>
+                  ) : selectedItem.status === "PUBLISHED" ? (
+                    <>
+                      {selectedItem.bids.length > 0 && (
+                        <p className="form-notice">
+                          This auction has bids. Details and photos cannot be
+                          changed after bidding starts. If the item identity or
+                          essential information is wrong, cancel this auction
+                          and publish a corrected listing. Existing bids will
+                          remain in history and bidders will be notified.
+                        </p>
+                      )}
+                      {selectedItem.bids.length === 0 &&
+                        now < selectedItem.endsAt &&
+                        !detailLoading && (
+                          <div className="photo-replacement">
+                            <label>
+                              Correct listing photos (before the first bid)
+                              <input
+                                type="file"
+                                accept="image/jpeg,image/png,image/webp"
+                                multiple
+                                onChange={handleReplacementPhotoSelection}
+                              />
+                            </label>
+                            {replacementPhotoFiles.length > 0 && (
+                              <>
+                                <p className="muted">
+                                  The following will replace all current photos:
+                                </p>
+                                <ul>
+                                  {replacementPhotoFiles.map((file) => (
+                                    <li key={`${file.name}-${file.lastModified}`}>
+                                      {file.name}
+                                    </li>
+                                  ))}
+                                </ul>
+                                <button
+                                  className="secondary-button"
+                                  type="button"
+                                  disabled={replacementPhotosBusy}
+                                  onClick={() => replaceListingPhotos(selectedItem)}
+                                >
+                                  {replacementPhotosBusy
+                                    ? "Replacing photos..."
+                                    : "Replace listing photos"}
+                                </button>
+                                <button
+                                  className="text-button"
+                                  type="button"
+                                  disabled={replacementPhotosBusy}
+                                  onClick={() => setReplacementPhotoFiles([])}
+                                >
+                                  Clear selection
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      <button
+                        className="cancel-listing-button"
+                        type="button"
+                        disabled={cancellingAuctionId === selectedItem.id}
+                        onClick={() => cancelListing(selectedItem.id)}
+                      >
+                        {cancellingAuctionId === selectedItem.id
+                          ? "Cancelling auction..."
+                          : "Cancel auction"}
+                      </button>
+                      {detailLoading ? (
+                        <button className="delete-listing-button" type="button" disabled>
+                          Checking whether this listing can be deleted...
+                        </button>
+                      ) : selectedAuctionEligibleForDeletion ? (
+                        <button
+                          className="delete-listing-button"
+                          type="button"
+                          disabled={deletingAuctionId === selectedItem.id}
+                          onClick={() => deleteListing(selectedItem)}
+                        >
+                          {deletingAuctionId === selectedItem.id
+                            ? "Deleting listing..."
+                            : "Delete listing"}
+                        </button>
+                      ) : selectedItem.bids.length === 0 && now < selectedItem.endsAt ? null : (
+                        <p className="form-notice">
+                          Physical deletion is available only for unexpired
+                          listings with no bids. Use cancellation to preserve
+                          this auction's history.
+                        </p>
+                      )}
+                    </>
+                  ) : selectedItem.status !== "CANCELLED" ? (
+                    <p className="form-notice">
+                      This auction is {selectedItem.status.toLowerCase()} and
+                      cannot be cancelled through the ordinary seller action.
+                      Approved results and handovers need a separate resolution
+                      workflow.
+                    </p>
                   ) : detailLoading ? (
                     <button className="delete-listing-button" type="button" disabled>
-                      Checking listing eligibility...
-                    </button>
-                  ) : selectedAuctionEligibleForDeletion ? (
-                    <button
-                      className="delete-listing-button"
-                      type="button"
-                      disabled={deletingAuctionId === selectedItem.id}
-                      onClick={() => deleteListing(selectedItem)}
-                    >
-                      {deletingAuctionId === selectedItem.id
-                        ? "Deleting listing..."
-                        : "Delete listing"}
+                      Checking deletion status...
                     </button>
                   ) : (
-                    <p className="form-notice">
-                      This listing cannot be deleted{selectedItem.bids.length > 0
-                        ? " because it has bids"
-                        : selectedItem.status !== "PUBLISHED"
-                          ? ` because its status is ${selectedItem.status.toLowerCase()}`
-                          : " because it has expired"}. Continue with the normal auction process.
-                    </p>
+                    <p className="form-notice">This listing is already cancelled.</p>
                   )}
                 </div>
               )}
@@ -1429,12 +2108,14 @@ function App() {
 
 function ProductCard({ item, now, countdown, onOpen }) {
   const price = leadingBid(item);
-  const closed = now >= item.endsAt;
+  const cancelled = item.status === "CANCELLED";
+  const closed = cancelled || now >= item.endsAt;
 
   return (
     <article className="product-card">
       <button className="product-image" style={{ backgroundColor: item.color }} onClick={onOpen} aria-label={`View ${item.title}`}>
         <span className="condition-pill">{item.condition}</span>
+        {cancelled && <span className="cancelled-pill">Cancelled</span>}
         {item.photoUrls[0] ? (
           <img className="product-photo" src={item.photoUrls[0]} alt="" />
         ) : (
@@ -1452,7 +2133,7 @@ function ProductCard({ item, now, countdown, onOpen }) {
           <div className="product-timer">
             <span className="muted-label">Closes in</span>
             <strong className={closed ? "closed-time" : ""}>
-              {closed ? "Closed" : countdown(item.endsAt)}
+              {cancelled ? "Cancelled" : closed ? "Closed" : countdown(item.endsAt)}
             </strong>
           </div>
         </div>
