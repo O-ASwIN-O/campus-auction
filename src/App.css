@@ -980,6 +980,100 @@
   font-weight: 500;
 }
 
+.save-search-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  margin: -4px 0 20px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.save-search-row p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.save-search-button {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.saved-search-list {
+  display: grid;
+  gap: 14px;
+}
+
+.saved-search-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-sm);
+}
+
+.saved-search-details {
+  min-width: 0;
+}
+
+.saved-search-details .eyebrow {
+  margin-bottom: 5px;
+}
+
+.saved-search-details h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+
+.saved-search-details p {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.saved-search-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.saved-search-actions .secondary-button,
+.saved-search-actions .cancel-listing-button,
+.saved-search-actions .primary-button {
+  width: auto;
+}
+
+.saved-search-editor {
+  max-width: none;
+  margin: 0;
+  padding: 22px;
+  animation: none;
+}
+
+.saved-search-editor .saved-search-actions {
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.saved-search-status {
+  padding: 28px;
+  color: var(--muted);
+  text-align: center;
+}
+
 /* ── 11. Empty / Loading States ────────────────────────── */
 .empty-state {
   padding: 60px 24px;
@@ -1972,6 +2066,28 @@
   .section-heading .primary-button {
     padding: 11px 16px;
     width: 100%;
+  }
+
+  .save-search-row,
+  .saved-search-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .save-search-button {
+    width: 100%;
+  }
+
+  .saved-search-actions {
+    width: 100%;
+  }
+
+  .saved-search-actions > button {
+    flex: 1 1 0;
+  }
+
+  .saved-search-editor {
+    padding: 20px 16px;
   }
 
   .detail-modal {
