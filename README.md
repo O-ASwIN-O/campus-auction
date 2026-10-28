@@ -1,6 +1,7 @@
 # Campus Auction
 
 Presentation Video - https://drive.google.com/file/d/1zQMv08Uz7e6lhqbGa1mGqL9gNB0aBvJ_/view?usp=drivesdk
+
 A campus marketplace for creating short-lived item auctions, placing bids, and
 coordinating a sale after the seller approves the result. The frontend is a
 React single-page application built with Vite. Supabase provides authentication,
