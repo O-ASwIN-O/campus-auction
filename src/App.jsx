@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase.js";
 import "./App.css";
 
@@ -47,6 +47,12 @@ function leadingBid(item) {
   return item.bids.length
     ? Math.max(...item.bids.map((bid) => bid.amount))
     : item.price;
+}
+
+function minimumNextBid(item) {
+  return item.bids.length
+    ? leadingBid(item) + item.increment
+    : Math.max(2, item.price + 0.01);
 }
 
 function mapBid(row) {
@@ -143,13 +149,28 @@ function mapAuction(row, bids, photoUrlsByPath) {
   };
 }
 
-async function fetchListings() {
-  const { data: auctionRows, error: auctionsError } = await supabase
+async function fetchListings({ mode = "active", sellerId } = {}) {
+  let auctionQuery = supabase
     .from("auctions")
     .select(
       "id, seller_id, title, description, category, item_condition, starting_price, min_increment, closes_at, photo_paths, status",
-    )
-    .order("closes_at", { ascending: true });
+    );
+
+  if (mode === "active") {
+    auctionQuery = auctionQuery
+      .eq("status", "published")
+      .gt("closes_at", new Date().toISOString());
+  } else if (mode === "cancelled") {
+    auctionQuery = auctionQuery.eq("status", "cancelled");
+  } else if (mode === "seller") {
+    if (!sellerId) throw new Error("Sign in to load your listings.");
+    auctionQuery = auctionQuery.eq("seller_id", sellerId);
+  } else {
+    throw new Error("Unsupported auction listing query.");
+  }
+
+  const { data: auctionRows, error: auctionsError } =
+    await auctionQuery.order("closes_at", { ascending: true });
 
   if (auctionsError) throw auctionsError;
   if (!auctionRows?.length) return [];
@@ -241,6 +262,8 @@ function NavButton({ children, onClick, className = "", disabled = false }) {
 }
 
 function App() {
+  const listingRequestId = useRef(0);
+  const notificationControlRef = useRef(null);
   const [page, setPage] = useState(() =>
     window.location.pathname.replace(/\/+$/, "") === "/reset-password"
       ? "reset-password"
@@ -289,6 +312,14 @@ function App() {
   const [closingSoon, setClosingSoon] = useState(false);
   const [bidAmount, setBidAmount] = useState("");
   const [notice, setNotice] = useState("");
+  const [notifications, setNotifications] = useState([]);
+  const [notificationsOwnerId, setNotificationsOwnerId] = useState(null);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState("");
+  const [notificationsErrorOwnerId, setNotificationsErrorOwnerId] = useState(null);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationActionBusy, setNotificationActionBusy] = useState(false);
+  const [notificationRefresh, setNotificationRefresh] = useState(0);
 
   const [loginName, setLoginName] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
@@ -308,7 +339,7 @@ function App() {
     category: "Books",
     condition: "Good",
     description: "",
-    price: "",
+    startingPrice: "",
     increment: "50",
     durationMinutes: "1440",
     customDurationMinutes: "",
@@ -336,6 +367,14 @@ function App() {
     } = supabase.auth.onAuthStateChange((event, session) => {
       if (!active) return;
       setUser(session?.user || null);
+      if (!session?.user) {
+        setNotifications([]);
+        setNotificationsOwnerId(null);
+        setNotificationsLoading(false);
+        setNotificationsError("");
+        setNotificationsErrorOwnerId(null);
+        setNotificationsOpen(false);
+      }
       if (event === "PASSWORD_RECOVERY" && session) {
         setPage("reset-password");
         setPasswordResetSessionReady(true);
@@ -371,16 +410,23 @@ function App() {
       });
 
     async function loadAuctions() {
+      const requestId = listingRequestId.current;
       setItemsLoading(true);
       setItemsError("");
       try {
         const listings = await fetchListings();
-        if (active) setItems(listings);
+        if (active && requestId === listingRequestId.current) {
+          setItems(listings);
+        }
       } catch (error) {
         console.error("Could not load Supabase auctions.", error);
-        if (active) setItemsError("Auctions could not be loaded. Please try again.");
+        if (active && requestId === listingRequestId.current) {
+          setItemsError("Auctions could not be loaded. Please try again.");
+        }
       } finally {
-        if (active) setItemsLoading(false);
+        if (active && requestId === listingRequestId.current) {
+          setItemsLoading(false);
+        }
       }
     }
 
@@ -402,10 +448,25 @@ function App() {
     const auctionIds = items.map((item) => item.id);
 
     const interval = setInterval(async () => {
-      const { data, error } = await supabase
+      let currentAuctionsQuery = supabase
         .from("auctions")
         .select("id")
         .in("id", auctionIds);
+
+      if (page === "my-listings" && currentUserId) {
+        currentAuctionsQuery = currentAuctionsQuery.eq(
+          "seller_id",
+          currentUserId,
+        );
+      } else if (page === "cancelled-history") {
+        currentAuctionsQuery = currentAuctionsQuery.eq("status", "cancelled");
+      } else {
+        currentAuctionsQuery = currentAuctionsQuery
+          .eq("status", "published")
+          .gt("closes_at", new Date().toISOString());
+      }
+
+      const { data, error } = await currentAuctionsQuery;
 
       if (!active) return;
       if (error) {
@@ -431,7 +492,7 @@ function App() {
       active = false;
       clearInterval(interval);
     };
-  }, [items]);
+  }, [currentUserId, items, page]);
 
   useEffect(() => {
     let active = true;
@@ -466,67 +527,126 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    let noticeTimeout;
 
     if (!currentUserId) return undefined;
 
-    async function loadCancellationNotices() {
+    async function loadNotifications() {
+      setNotificationsLoading(true);
       const { data, error } = await supabase
         .from("notifications")
-        .select("id, message")
-        .eq("notification_type", "auction_cancelled")
-        .eq("is_read", false)
+        .select("id, notification_type, message, is_read, created_at, auction_id")
+        .eq("user_id", currentUserId)
         .order("created_at", { ascending: false })
-        .limit(25);
+        .limit(50);
 
       if (!active) return;
       if (error) {
-        console.error("Could not load auction cancellation notifications.", error);
-        return;
+        console.error("Could not load notifications.", error);
+        setNotificationsError("Notifications could not be loaded. Please try again.");
+        setNotificationsErrorOwnerId(currentUserId);
+      } else {
+        setNotifications(data || []);
+        setNotificationsOwnerId(currentUserId);
+        setNotificationsError("");
+        setNotificationsErrorOwnerId(null);
       }
-      if (!data?.length) return;
-
-      setNotice(
-        data.length === 1
-          ? data[0].message
-          : `${data.length} auctions you bid on were cancelled. Your bid history is preserved.`,
-      );
-      clearTimeout(noticeTimeout);
-      noticeTimeout = setTimeout(() => {
-        if (active) setNotice("");
-      }, 5000);
-
-      const { error: updateError } = await supabase
-        .from("notifications")
-        .update({ is_read: true })
-        .in("id", data.map((notification) => notification.id));
-      if (updateError) {
-        console.error("Could not mark cancellation notifications as read.", updateError);
-      }
+      setNotificationsLoading(false);
     }
 
-    void loadCancellationNotices();
+    void loadNotifications();
     const interval = setInterval(() => {
-      void loadCancellationNotices();
+      void loadNotifications();
     }, 30000);
 
     return () => {
       active = false;
       clearInterval(interval);
-      clearTimeout(noticeTimeout);
     };
-  }, [currentUserId]);
+  }, [currentUserId, notificationRefresh]);
+
+  useEffect(() => {
+    function handleNotificationDismiss(event) {
+      if (!notificationControlRef.current?.contains(event.target)) {
+        setNotificationsOpen(false);
+      }
+    }
+
+    function handleNotificationEscape(event) {
+      if (event.key === "Escape") setNotificationsOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handleNotificationDismiss);
+    document.addEventListener("keydown", handleNotificationEscape);
+    return () => {
+      document.removeEventListener("pointerdown", handleNotificationDismiss);
+      document.removeEventListener("keydown", handleNotificationEscape);
+    };
+  }, []);
 
   function flash(message) {
     setNotice(message);
     setTimeout(() => setNotice(""), 3500);
   }
 
-  async function refreshListings() {
+  async function markNotificationRead(notificationId) {
+    if (!currentUserId) return;
+
+    setNotificationActionBusy(true);
+    try {
+      const { error } = await supabase
+        .from("notifications")
+        .update({ is_read: true })
+        .eq("id", notificationId)
+        .eq("user_id", currentUserId)
+        .eq("is_read", false);
+
+      if (error) throw error;
+      setNotifications((previous) =>
+        previous.map((entry) =>
+          entry.id === notificationId ? { ...entry, is_read: true } : entry,
+        ),
+      );
+    } catch (error) {
+      console.error("Could not mark notification as read.", error);
+      flash("This notification could not be marked as read.");
+    } finally {
+      setNotificationActionBusy(false);
+    }
+  }
+
+  async function markAllNotificationsRead() {
+    if (!currentUserId) return;
+
+    setNotificationActionBusy(true);
+    try {
+      const { error } = await supabase
+        .from("notifications")
+        .update({ is_read: true })
+        .eq("user_id", currentUserId)
+        .eq("is_read", false);
+
+      if (error) throw error;
+      setNotifications((previous) =>
+        previous.map((entry) => ({ ...entry, is_read: true })),
+      );
+    } catch (error) {
+      console.error("Could not mark all notifications as read.", error);
+      flash("Notifications could not be marked as read.");
+    } finally {
+      setNotificationActionBusy(false);
+    }
+  }
+
+  async function refreshListings(mode = "active") {
+    const requestId = ++listingRequestId.current;
     setItemsLoading(true);
     setItemsError("");
     try {
-      const listings = await fetchListings();
+      const listings = await fetchListings({
+        mode,
+        sellerId: mode === "seller" ? user?.id : undefined,
+      });
+      if (requestId !== listingRequestId.current) return;
       setItems(listings);
       setSelectedItem((current) =>
         current && !listings.some((item) => item.id === current.id)
@@ -534,10 +654,11 @@ function App() {
           : current,
       );
     } catch (error) {
+      if (requestId !== listingRequestId.current) return;
       console.error("Could not refresh Supabase auctions.", error);
       setItemsError("Auctions could not be refreshed. Please try again.");
     } finally {
-      setItemsLoading(false);
+      if (requestId === listingRequestId.current) setItemsLoading(false);
     }
   }
 
@@ -545,8 +666,18 @@ function App() {
     setSelectedItem(null);
     setPage(nextPage);
     setNotice("");
-    if (["home", "browse", "my-listings"].includes(nextPage)) {
-      void refreshListings();
+    const listingMode =
+      nextPage === "my-listings"
+        ? "seller"
+        : nextPage === "cancelled-history"
+          ? "cancelled"
+          : ["home", "browse"].includes(nextPage)
+            ? "active"
+            : null;
+    if (listingMode) {
+      void refreshListings(listingMode);
+    } else {
+      listingRequestId.current += 1;
     }
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -719,11 +850,23 @@ function App() {
         return;
       }
 
+      const onBuyerScreen = ["home", "browse"].includes(page);
+      if (
+        onBuyerScreen &&
+        (latestItem.status !== "PUBLISHED" || latestItem.endsAt <= Date.now())
+      ) {
+        setItems((previous) =>
+          previous.filter((entry) => entry.id !== item.id),
+        );
+        flash("This auction is no longer open for bidding.");
+        return;
+      }
+
       setItems((previous) =>
         previous.map((entry) => (entry.id === item.id ? latestItem : entry)),
       );
       setSelectedItem(latestItem);
-      setBidAmount(String(leadingBid(latestItem) + latestItem.increment));
+      setBidAmount(String(minimumNextBid(latestItem)));
     } catch (error) {
       console.error("Could not load the latest auction details.", error);
       flash("Auction details could not be verified. Please try again.");
@@ -756,11 +899,15 @@ function App() {
       return;
     }
 
-    const minimum = item.bids.length
-      ? leadingBid(item) + item.increment
-      : item.price;
+    const minimum = minimumNextBid(item);
 
-    if (!Number.isFinite(amount) || amount < minimum) {
+    if (
+      !Number.isFinite(amount) ||
+      amount <= 1 ||
+      amount <= leadingBid(item) ||
+      amount < minimum ||
+      !/^\d+(?:\.\d{1,2})?$/.test(bidAmount.trim())
+    ) {
       flash(`Your minimum valid bid is ${money(minimum)}.`);
       return;
     }
@@ -770,7 +917,7 @@ function App() {
     try {
       ({ error } = await supabase.rpc("place_bid", {
         p_auction_id: item.id,
-        p_amount: amount,
+        p_amount: bidAmount.trim(),
       }));
     } catch (requestError) {
       console.error("Could not send the bid request.", requestError);
@@ -799,7 +946,7 @@ function App() {
         previous.map((entry) => (entry.id === item.id ? updatedItem : entry)),
       );
       setSelectedItem(updatedItem);
-      setBidAmount(String(leadingBid(updatedItem) + updatedItem.increment));
+      setBidAmount(String(minimumNextBid(updatedItem)));
       flash("Your bid was placed.");
     } catch (error) {
       console.error("Bid succeeded, but refreshing bid history failed.", error);
@@ -970,7 +1117,7 @@ function App() {
       return;
     }
 
-    const price = Number(form.price);
+    const price = Number(form.startingPrice);
     const increment = Number(form.increment);
     const durationMinutes =
       form.durationMinutes === "custom"
@@ -982,6 +1129,8 @@ function App() {
       !form.description.trim() ||
       !Number.isFinite(price) ||
       price <= 0 ||
+      price > 9999999999.99 ||
+      !/^\d+(?:\.\d{1,2})?$/.test(form.startingPrice) ||
       !Number.isFinite(increment) ||
       increment <= 0 ||
       !Number.isInteger(durationMinutes) ||
@@ -989,7 +1138,7 @@ function App() {
       durationMinutes > maxAuctionDurationMinutes ||
       photoFiles.length > 5
     ) {
-      flash("Enter valid item details, price, and a duration between 1 minute and 30 days.");
+      flash("Enter a starting price and valid item details, increment, and duration.");
       return;
     }
 
@@ -1031,7 +1180,7 @@ function App() {
         description: form.description.trim(),
         category: form.category,
         item_condition: form.condition,
-        starting_price: price,
+        starting_price: form.startingPrice,
         min_increment: increment,
         closes_at: closesAt,
         photo_paths: uploadedPaths,
@@ -1071,7 +1220,7 @@ function App() {
         category: "Books",
         condition: "Good",
         description: "",
-        price: "",
+        startingPrice: "",
         increment: "50",
         durationMinutes: "1440",
         customDurationMinutes: "",
@@ -1143,7 +1292,9 @@ function App() {
 
     setItems((previous) =>
       previous.map((entry) =>
-        entry.id === itemId ? { ...entry, status: "CANCELLED" } : entry,
+        entry.id === itemId
+          ? { ...entry, status: "CANCELLED" }
+          : entry,
       ),
     );
     setSelectedItem((previous) =>
@@ -1226,7 +1377,13 @@ function App() {
       flash("Listing and its photos were deleted.");
 
       try {
-        setItems(await fetchListings());
+        await refreshListings(
+          page === "my-listings"
+            ? "seller"
+            : page === "cancelled-history"
+              ? "cancelled"
+              : "active",
+        );
       } catch (refreshError) {
         console.error("Listing deleted, but refreshing auctions failed.", refreshError);
         flash("Listing deleted, but the latest auctions could not be refreshed.");
@@ -1290,10 +1447,6 @@ function App() {
       matchesClosing
     );
   });
-  const cancelledItems =
-    itemsLoading || itemsError
-      ? []
-      : items.filter((item) => item.status === "CANCELLED");
   const sellerItems =
     itemsLoading || itemsError
       ? []
@@ -1314,6 +1467,13 @@ function App() {
       now < selectedItem.endsAt &&
       selectedItem.bids.length === 0,
   );
+  const userNotifications =
+    notificationsOwnerId === currentUserId ? notifications : [];
+  const userNotificationsError =
+    notificationsErrorOwnerId === currentUserId ? notificationsError : "";
+  const unreadNotificationCount = userNotifications.filter(
+    (notification) => !notification.is_read,
+  ).length;
 
   function countdown(endTime) {
     const remaining = Math.max(0, endTime - now);
@@ -1333,11 +1493,108 @@ function App() {
 
         <nav className="nav-links">
           <NavButton onClick={() => go("browse")}>Buy items</NavButton>
+          <NavButton onClick={() => go("cancelled-history")}>
+            Cancelled history
+          </NavButton>
           <NavButton onClick={() => user ? go("sell") : requestLogin("sell")}>
             Sell items
           </NavButton>
           {user ? (
             <>
+              <div className="notification-control" ref={notificationControlRef}>
+                <button
+                  className="notification-toggle"
+                  type="button"
+                  aria-label={
+                    unreadNotificationCount > 0
+                      ? `Notifications, ${unreadNotificationCount} unread`
+                      : "Notifications"
+                  }
+                  aria-expanded={notificationsOpen}
+                  aria-haspopup="dialog"
+                  onClick={() => {
+                    if (!notificationsOpen) {
+                      setNotificationRefresh((count) => count + 1);
+                    }
+                    setNotificationsOpen((open) => !open);
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+                    <path d="M10 21h4" />
+                  </svg>
+                  {unreadNotificationCount > 0 && (
+                    <span className="notification-badge">
+                      {unreadNotificationCount > 99 ? "99+" : unreadNotificationCount}
+                    </span>
+                  )}
+                </button>
+                {notificationsOpen && (
+                  <section
+                    className="notification-panel"
+                    aria-label="Your notifications"
+                    role="dialog"
+                  >
+                    <div className="notification-panel-header">
+                      <strong>Notifications</strong>
+                      {unreadNotificationCount > 0 && (
+                        <button
+                          type="button"
+                          className="notification-mark-all"
+                          disabled={notificationActionBusy}
+                          onClick={markAllNotificationsRead}
+                        >
+                          Mark all read
+                        </button>
+                      )}
+                    </div>
+                    {userNotificationsError ? (
+                      <div className="notification-empty">
+                        <p>{userNotificationsError}</p>
+                        <button
+                          type="button"
+                          className="notification-mark-all"
+                          onClick={() =>
+                            setNotificationRefresh((count) => count + 1)
+                          }
+                        >
+                          Try again
+                        </button>
+                      </div>
+                    ) : notificationsLoading && userNotifications.length === 0 ? (
+                      <p className="notification-empty">Loading notifications...</p>
+                    ) : userNotifications.length === 0 ? (
+                      <p className="notification-empty">You have no notifications.</p>
+                    ) : (
+                      <div className="notification-list">
+                        {userNotifications.map((notification) => (
+                          <article
+                            className={`notification-item${notification.is_read ? "" : " is-unread"}`}
+                            key={notification.id}
+                          >
+                            <p>{notification.message}</p>
+                            <time dateTime={notification.created_at}>
+                              {new Date(notification.created_at).toLocaleString()}
+                            </time>
+                            {!notification.is_read && (
+                              <button
+                                type="button"
+                                className="notification-mark-all"
+                                disabled={notificationActionBusy}
+                                onClick={() =>
+                                  markNotificationRead(notification.id)
+                                }
+                              >
+                                Mark as read
+                              </button>
+                            )}
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                )}
+              </div>
               <NavButton onClick={() => go("my-listings")}>My listings</NavButton>
               <NavButton className="nav-login" onClick={handleLogout}>
                 Sign out
@@ -1524,32 +1781,51 @@ function App() {
               <div className="empty-state">
                 <span>🔎</span>
                 <h3>No active auctions match</h3>
-                <p>Try changing your search or filters. Cancelled auction history is shown below.</p>
+                <p>Try changing your search or filters.</p>
               </div>
             )}
-            {cancelledItems.length > 0 && (
-              <section className="cancelled-auction-history">
-                <div className="section-heading">
-                  <div>
-                    <span className="eyebrow">PUBLIC RECORD</span>
-                    <h2>Cancelled auction history</h2>
-                    <p className="subheading">
-                      Cancelled auctions no longer accept bids. Existing bids remain visible.
-                    </p>
-                  </div>
-                </div>
-                <div className="product-grid">
-                  {cancelledItems.map((item) => (
-                    <ProductCard
-                      key={item.id}
-                      item={item}
-                      now={now}
-                      countdown={countdown}
-                      onOpen={() => openItem(item)}
-                    />
-                  ))}
-                </div>
-              </section>
+          </section>
+        )}
+
+        {page === "cancelled-history" && (
+          <section className="marketplace page-section">
+            <div className="section-heading">
+              <div>
+                <span className="eyebrow">PUBLIC RECORD</span>
+                <h1>Cancelled Auction History</h1>
+                <p className="subheading">
+                  Cancelled auctions are not open for bidding. Existing bid
+                  records remain available for review.
+                </p>
+              </div>
+              <button className="secondary-button" onClick={() => go("browse")}>
+                Back to active auctions
+              </button>
+            </div>
+            {itemsLoading ? (
+              <p className="results-count">Loading cancelled auction history...</p>
+            ) : itemsError ? (
+              <div className="empty-state" role="alert">
+                <h3>History is unavailable</h3>
+                <p>{itemsError}</p>
+              </div>
+            ) : items.length === 0 ? (
+              <div className="empty-state">
+                <h3>No cancelled auctions</h3>
+                <p>Cancelled listings will appear here for recordkeeping.</p>
+              </div>
+            ) : (
+              <div className="product-grid">
+                {items.map((item) => (
+                  <ProductCard
+                    key={item.id}
+                    item={item}
+                    now={now}
+                    countdown={countdown}
+                    onOpen={() => openItem(item)}
+                  />
+                ))}
+              </div>
             )}
           </section>
         )}
@@ -1877,13 +2153,28 @@ function App() {
                 <div className="form-row">
                   <label>
                     Starting price (₹)
-                    <input required type="number" min="0.01" step="0.01" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} placeholder="500" />
+                    <input
+                      required
+                      type="number"
+                      min="0.01"
+                      max="9999999999.99"
+                      step="0.01"
+                      value={form.startingPrice}
+                      onChange={(event) =>
+                        setForm({ ...form, startingPrice: event.target.value })
+                      }
+                      placeholder="e.g. 500"
+                    />
                   </label>
                   <label>
                     Minimum bid increment (₹)
                     <input required type="number" min="0.01" step="0.01" value={form.increment} onChange={(event) => setForm({ ...form, increment: event.target.value })} />
                   </label>
                 </div>
+                <p className="form-notice">
+                  The first bid must be greater than your starting price. Later
+                  bids must meet the current highest bid plus the minimum increment.
+                </p>
                 <label>
                   Auction duration
                   <select
@@ -2050,7 +2341,11 @@ function App() {
                 </div>
               )}
               <div className="detail-price">
-                <span>Current leading bid</span>
+                <span>
+                  {selectedItem.bids.length
+                    ? "Current highest bid"
+                    : "Starting bid"}
+                </span>
                 <strong>{money(leadingBid(selectedItem))}</strong>
               </div>
               <div className="detail-meta">
@@ -2060,6 +2355,11 @@ function App() {
                     ? "Cancelled"
                     : countdown(selectedItem.endsAt)}
                 </span>
+                {selectedItem.status === "PUBLISHED" && now < selectedItem.endsAt && (
+                  <span>
+                    Minimum next valid bid: {money(minimumNextBid(selectedItem))}
+                  </span>
+                )}
               </div>
               {selectedItem.status === "CANCELLED" && (
                 <p className="form-notice cancellation-notice" role="status">
@@ -2088,7 +2388,16 @@ function App() {
               {selectedItem.status === "PUBLISHED" && now < selectedItem.endsAt ? (
                 <form className="bid-form" onSubmit={placeBid}>
                   <label htmlFor="bid-amount">Your bid (₹)</label>
-                  <input id="bid-amount" type="number" min={selectedItem.bids.length ? leadingBid(selectedItem) + selectedItem.increment : selectedItem.price} step="0.01" required value={bidAmount} onChange={(event) => setBidAmount(event.target.value)} disabled={bidBusy} />
+                  <input
+                    id="bid-amount"
+                    type="number"
+                    min={minimumNextBid(selectedItem)}
+                    step="0.01"
+                    required
+                    value={bidAmount}
+                    onChange={(event) => setBidAmount(event.target.value)}
+                    disabled={bidBusy}
+                  />
                   <button className="primary-button full-button" type="submit" disabled={bidBusy}>
                     {bidBusy
                       ? "Placing bid..."
@@ -2254,7 +2563,9 @@ function ProductCard({ item, now, countdown, onOpen }) {
         <h3>{item.title}</h3>
         <div className="product-price-row">
           <div>
-            <span className="muted-label">Leading bid</span>
+            <span className="muted-label">
+              {item.bids.length ? "Highest bid" : "Starting bid"}
+            </span>
             <strong>{money(price)}</strong>
           </div>
           <div className="product-timer">
