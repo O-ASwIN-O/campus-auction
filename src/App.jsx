@@ -401,7 +401,14 @@ function App() {
   const [chatSending, setChatSending] = useState(false);
   const [chatFeedback, setChatFeedback] = useState(null);
   const [chatRefresh, setChatRefresh] = useState(0);
-
+  const [automaticBidConfig, setAutomaticBidConfig] = useState(null);
+  const [automaticBidConfigAuctionId, setAutomaticBidConfigAuctionId] =
+    useState(null);
+  const [automaticBidLoading, setAutomaticBidLoading] = useState(false);
+  const [automaticBidBusy, setAutomaticBidBusy] = useState(false);
+  const [automaticBidDraft, setAutomaticBidDraft] = useState("");
+  const [automaticBidConsent, setAutomaticBidConsent] = useState(false);
+  const [automaticBidError, setAutomaticBidError] = useState("");
   const [loginName, setLoginName] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -703,6 +710,64 @@ function App() {
       active = false;
     };
   }, [currentUserId, savedSearchRefresh]);
+
+  useEffect(() => {
+    let active = true;
+    const auctionId = selectedItem?.id;
+
+    if (
+      !auctionId ||
+      !currentUserId ||
+      selectedItem?.sellerId === currentUserId ||
+      selectedItem?.status !== "PUBLISHED" ||
+      Date.now() >= selectedItem?.endsAt
+    ) {
+      return undefined;
+    }
+
+    async function loadAutomaticBidConfig() {
+      setAutomaticBidLoading(true);
+      setAutomaticBidError("");
+      try {
+        const { data, error } = await supabase.rpc(
+          "get_my_automatic_bid",
+          { p_auction_id: auctionId },
+        );
+        if (error) throw error;
+        if (!active) return;
+
+        const config = data?.[0] || null;
+        setAutomaticBidConfig(config);
+        setAutomaticBidConfigAuctionId(auctionId);
+        setAutomaticBidDraft(
+          config?.max_amount == null ? "" : String(config.max_amount),
+        );
+        setAutomaticBidConsent(false);
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not load automatic-bid settings.", error);
+        setAutomaticBidConfig(null);
+        setAutomaticBidConfigAuctionId(auctionId);
+        setAutomaticBidDraft("");
+        setAutomaticBidError(
+          "Automatic-bid settings could not be loaded. Check that migration 019 is installed and try again.",
+        );
+      } finally {
+        if (active) setAutomaticBidLoading(false);
+      }
+    }
+
+    void loadAutomaticBidConfig();
+    return () => {
+      active = false;
+    };
+  }, [
+    currentUserId,
+    selectedItem?.id,
+    selectedItem?.sellerId,
+    selectedItem?.status,
+    selectedItem?.endsAt,
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -1335,6 +1400,12 @@ function App() {
     setChatDraft("");
     setChatRequestKey(null);
     setChatFeedback(null);
+    setAutomaticBidConfig(null);
+    setAutomaticBidConfigAuctionId(null);
+    setAutomaticBidLoading(false);
+    setAutomaticBidDraft("");
+    setAutomaticBidConsent(false);
+    setAutomaticBidError("");
     setAuctionContact(null);
     setAuctionContactError("");
     setAuctionContactLoading(false);
@@ -1485,6 +1556,110 @@ function App() {
       );
     } finally {
       setResultActionBusy(false);
+    }
+  }
+
+  async function saveAutomaticBid() {
+    if (!user || !selectedItem || automaticBidBusy) return;
+
+    if (!automaticBidConsent) {
+      setAutomaticBidError(
+        "Confirm that you authorize automatic bids up to the amount shown.",
+      );
+      return;
+    }
+
+    const rawMaximum = automaticBidDraft.trim();
+    const maximum = Number(rawMaximum);
+    if (
+      !/^\d+(?:\.\d{1,2})?$/.test(rawMaximum) ||
+      !Number.isFinite(maximum) ||
+      maximum <= 0 ||
+      maximum > 9999999999.99
+    ) {
+      setAutomaticBidError(
+        "Enter a positive maximum amount with at most two decimal places.",
+      );
+      return;
+    }
+
+    const approved = window.confirm(
+      `Enable automatic bidding for "${selectedItem.title}" with a maximum of ${money(maximum)}?\n\nCampus Auction may place bids automatically while this auction is eligible, and will never bid above this amount. You can disable automatic bidding from this auction's details at any time.`,
+    );
+    if (!approved) return;
+
+    setAutomaticBidBusy(true);
+    setAutomaticBidError("");
+    try {
+      const { data, error } = await supabase.rpc(
+        "configure_automatic_bid",
+        {
+          p_auction_id: selectedItem.id,
+          p_max_amount: rawMaximum,
+        },
+      );
+      if (error) throw error;
+
+      const config = data?.[0];
+      if (!config) {
+        throw new Error("The automatic-bid configuration was not returned.");
+      }
+
+      setAutomaticBidConfig(config);
+      setAutomaticBidConfigAuctionId(selectedItem.id);
+      setAutomaticBidDraft(String(config.max_amount));
+      setAutomaticBidConsent(false);
+      setNotificationRefresh((refresh) => refresh + 1);
+      flash("Automatic bidding is configured for this auction.");
+    } catch (error) {
+      console.error("Could not configure automatic bidding.", error);
+      setAutomaticBidError(
+        typeof error?.message === "string" && error.message.trim()
+          ? error.message
+          : "Automatic bidding could not be configured. Please try again.",
+      );
+    } finally {
+      setAutomaticBidBusy(false);
+    }
+  }
+
+  async function disableAutomaticBid() {
+    if (!user || !selectedItem || automaticBidBusy) return;
+
+    if (
+      !window.confirm(
+        `Disable automatic bidding for "${selectedItem.title}"? No further automatic bids will be placed.`,
+      )
+    ) {
+      return;
+    }
+
+    setAutomaticBidBusy(true);
+    setAutomaticBidError("");
+    try {
+      const { data, error } = await supabase.rpc(
+        "disable_automatic_bid",
+        { p_auction_id: selectedItem.id },
+      );
+      if (error) throw error;
+      if (!data) {
+        throw new Error("Automatic bidding was not active for this auction.");
+      }
+
+      setAutomaticBidConfig((previous) =>
+        previous ? { ...previous, is_active: false } : previous,
+      );
+      setAutomaticBidConsent(false);
+      flash("Automatic bidding is disabled.");
+    } catch (error) {
+      console.error("Could not disable automatic bidding.", error);
+      setAutomaticBidError(
+        typeof error?.message === "string" && error.message.trim()
+          ? error.message
+          : "Automatic bidding could not be disabled. Please try again.",
+      );
+    } finally {
+      setAutomaticBidBusy(false);
     }
   }
 
@@ -3260,6 +3435,118 @@ function App() {
               ) : (
                 <p className="form-notice">This auction is no longer accepting bids.</p>
               )}
+              {selectedItem.status === "PUBLISHED" &&
+                now < selectedItem.endsAt &&
+                !isSelectedAuctionOwner && (
+                  <section className="automatic-bid-panel">
+                    <h3>Automatic bidding</h3>
+                    {automaticBidError && (
+                      <p className="automatic-bid-error" role="alert">
+                        {automaticBidError}
+                      </p>
+                    )}
+                    {!user ? (
+                      <>
+                        <p>
+                          Sign in to authorize automatic bids with a private
+                          maximum limit.
+                        </p>
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() => requestLogin("buy")}
+                        >
+                          Sign in to set a maximum
+                        </button>
+                      </>
+                    ) : automaticBidConfigAuctionId !== selectedItem.id &&
+                      automaticBidLoading ? (
+                      <p role="status">Loading your private settings...</p>
+                    ) : (
+                      <>
+                        {automaticBidConfigAuctionId === selectedItem.id &&
+                          automaticBidConfig && (
+                            <p className="automatic-bid-status">
+                              Your maximum:{" "}
+                              <strong>
+                                {money(automaticBidConfig.max_amount)}
+                              </strong>
+                              {" · "}
+                              {automaticBidConfig.is_active
+                                ? automaticBidConfig.reached_limit
+                                  ? "Active; next valid bid exceeds your limit."
+                                  : "Active"
+                                : "Not active"}
+                            </p>
+                          )}
+                        <label htmlFor="automatic-bid-maximum">
+                          {automaticBidConfigAuctionId === selectedItem.id &&
+                          automaticBidConfig
+                            ? "Maximum authorized amount (₹)"
+                            : "Set maximum authorized amount (₹)"}
+                          <input
+                            id="automatic-bid-maximum"
+                            type="number"
+                            min="0.01"
+                            max="9999999999.99"
+                            step="0.01"
+                            value={automaticBidDraft}
+                            onChange={(event) => {
+                              setAutomaticBidDraft(event.target.value);
+                              setAutomaticBidConsent(false);
+                              setAutomaticBidError("");
+                            }}
+                            disabled={automaticBidBusy || automaticBidLoading}
+                          />
+                        </label>
+                        <label className="automatic-bid-consent">
+                          <input
+                            type="checkbox"
+                            checked={automaticBidConsent}
+                            onChange={(event) => {
+                              setAutomaticBidConsent(event.target.checked);
+                              setAutomaticBidError("");
+                            }}
+                            disabled={automaticBidBusy}
+                          />
+                          I authorize bids up to{" "}
+                          {Number(automaticBidDraft) > 0
+                            ? money(Number(automaticBidDraft))
+                            : "the amount entered"}. The limit will not be
+                          exceeded, and I can disable this at any time.
+                        </label>
+                        <button
+                          className="primary-button full-button"
+                          type="button"
+                          disabled={
+                            automaticBidBusy ||
+                            automaticBidLoading ||
+                            !automaticBidConsent
+                          }
+                          onClick={saveAutomaticBid}
+                        >
+                          {automaticBidBusy
+                            ? "Saving authorization..."
+                            : automaticBidConfigAuctionId === selectedItem.id &&
+                                automaticBidConfig
+                              ? "Confirm and update maximum"
+                              : "Confirm and enable automatic bidding"}
+                        </button>
+                        {automaticBidConfigAuctionId === selectedItem.id &&
+                          automaticBidConfig?.is_active && (
+                          <button
+                            className="cancel-listing-button"
+                            type="button"
+                            disabled={automaticBidBusy}
+                            onClick={disableAutomaticBid}
+                          >
+                            Disable automatic bidding
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </section>
+                )}
               {isSelectedAuctionOwner && (
                 <div className="seller-delete-section">
                   {selectedDeletionPending ? (

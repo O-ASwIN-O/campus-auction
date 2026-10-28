@@ -1914,6 +1914,74 @@
   border-radius: var(--r-md);
 }
 
+.automatic-bid-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: rgba(240, 250, 243, 0.78);
+}
+
+.automatic-bid-panel h3 {
+  margin: 0;
+}
+
+.automatic-bid-panel > p,
+.automatic-bid-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.automatic-bid-panel label:not(.automatic-bid-consent) {
+  display: grid;
+  gap: 7px;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.automatic-bid-panel input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  padding: 11px 14px;
+  border: 1px solid rgba(59, 150, 99, 0.20);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+}
+
+.automatic-bid-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.automatic-bid-consent input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  accent-color: var(--green-500);
+}
+
+.automatic-bid-error {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--r-sm);
+  background: var(--danger-light);
+  color: var(--danger) !important;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .bid-form label {
   margin-bottom: 7px;
   color: var(--muted);
@@ -2085,6 +2153,8 @@
   .saved-search-actions > button {
     flex: 1 1 0;
   }
+
+
 
   .saved-search-editor {
     padding: 20px 16px;
