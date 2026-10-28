@@ -100,6 +100,8 @@ database.
 | `015_auction_chat_and_expiry_cleanup.sql` | Adds private per-buyer conversations, authorization-checked chat RPCs, and scheduled expired-chat cleanup. | Requires migrations 001–014 and the `pg_cron` extension available from the migration 011 scheduler setup. |
 | `016_saved_search_notification_type.sql` | Adds the notification type for saved-search matches. | Run to completion before migration 017 uses the enum value. |
 | `017_saved_searches_and_matching_alerts.sql` | Adds owner-private saved searches, RLS, duplicate prevention, and a database trigger that creates persistent alerts when an eligible auction is published. | Requires migrations 001–016 in order. Does not require a separate scheduler or browser polling. |
+| `018_last_minute_auction_extensions.sql` | Extends an open auction to 60 seconds after an accepted bid in its final 30 seconds. | Requires the auction and bid schema from migrations 001–017. The bid insert and extension share a transaction. |
+| `019_automatic_bidding.sql` | Adds private per-user maximums and secure RPCs that place proxy bids in the same transaction as bidding changes. | Requires migrations 001–018. Direct access to maximums is revoked; configure, read, and disable them through the provided RPCs. |
 
 Migrations 010 and 011 are present in the repository, but their live Supabase
 application status must be confirmed in the Supabase project. After applying
@@ -118,6 +120,48 @@ description, and category, and maximum price is compared with `starting_price`.
 Saved searches that match multiple criteria require every specified criterion
 to match. Condition and closing-time browse filters are not part of saved-search
 matching.
+
+Migrations 018 and 019 are also local files until deliberately reviewed and
+applied to the intended Supabase project. Migration 018 resets an auction's
+deadline to 60 seconds after each accepted bid received within the final 30
+seconds; the database deadline remains authoritative. Migration 019 extends
+`place_bid` while preserving its existing validations, and adds
+`configure_automatic_bid`, `get_my_automatic_bid`, and
+`disable_automatic_bid`. Each user can privately configure a maximum per
+auction. Proxy responses are serialized with the auction row, use the minimum
+amount needed to beat the next competing maximum where possible, and never
+exceed the configured maximum. The UI requires an explicit checkbox and a
+confirmation step before enabling automatic bidding. The SQL has not been
+executed by the application; review and test it in a non-production project
+before applying it.
+
+### Auction assistant
+
+The Auction assistant tab can search currently published, unexpired auctions
+using built-in structured parsing without login or sending the prompt to an AI
+provider. It can filter by keywords, category, and maximum **starting** price,
+sort cheapest results by current bid, and compare auctions with the signed-in
+user's private saved searches. Search criteria matching and auction results
+are processed in the browser using data the application already makes
+available to that user; saved-search contents are not sent to the AI function.
+
+Hosted AI interpretation is optional and off by default. A user must sign in
+and check the consent box before the prompt is sent to the
+`auction-assistant` Supabase Edge Function. Add `OPENAI_API_KEY` as an Edge
+Function secret in the Supabase project settings (never as a `VITE_` variable),
+then deploy from the repository with:
+
+```sh
+supabase functions deploy auction-assistant
+```
+
+`OPENAI_MODEL` is optional and defaults to `gpt-4o-mini`. The function
+verifies the caller's Supabase session and requests search criteria only; it
+does not place bids or receive account details, bid history, chat messages, or
+saved-search contents. If the function is unavailable, the UI displays a
+notice and falls back to built-in search. Prompts sent to hosted AI are
+processed by the configured provider, so use that option only with
+appropriate user consent and provider configuration.
 
 For example, these read-only checks can be run in the Supabase SQL Editor after
 the migrations:
@@ -272,9 +316,12 @@ src/
   App.jsx                 Main UI and Supabase workflows
   App.css                 Application styles
   supabase.js             Supabase client and public environment configuration
+  AuctionAssistant.jsx    Auction search assistant interface
+  assistantSearch.js      Built-in search parsing and saved-search matching
 supabase/
   migrations/             Ordered database schema and function changes
   functions/
+    auction-assistant/    Optional authenticated AI search interpreter
     cleanup-cancelled-auctions/
                            Server-side cancelled-auction photo/record cleanup
 public/                   Static assets
@@ -288,9 +335,9 @@ npm run lint
 npm run build
 ```
 
-There is currently no automated functional-test script in `package.json`.
-Build and lint checks do not test live Supabase Auth, Storage, RLS, RPCs, or
-scheduled jobs.
+`npm test` runs the focused Node.js tests for assistant prompt parsing,
+criteria validation, and saved-search matching. Build and lint checks do not
+test live Supabase Auth, Storage, RLS, RPCs, or scheduled jobs.
 
 ## Manual verification checklist
 
@@ -304,6 +351,17 @@ unauthorized-access checks:
   photos. Confirm it appears in active browsing.
 - Place bids from the buyer account. Test a valid bid, a bid at or below the
   current highest bid, a seller self-bid, and a bid after expiry.
+- After applying 018 and 019 to a test project, configure automatic bidding
+  for two buyers on the same auction. Test that responses respect each private
+  maximum, concurrent bids are serialized, users can disable their own limit,
+  and neither buyer can read the other's maximum. Place an accepted bid within
+  the final 30 seconds and verify the deadline extends to 60 seconds after it.
+- Open the Auction assistant while signed out and test keyword/category/price
+  parsing, cheapest sorting, empty results, and opening a result in the
+  existing auction modal. Sign in to test matching private saved searches.
+  Deploy and configure the optional Edge Function to test hosted interpretation
+  only after explicitly checking the consent box; verify missing configuration
+  falls back to built-in search with a notice.
 - Confirm public bid history omits private bidder email information.
 - With 011 installed, wait for the cron job to process an expired auction.
   Check auction status and persistent notifications for the seller and
