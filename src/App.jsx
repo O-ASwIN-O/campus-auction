@@ -160,11 +160,11 @@ async function fetchListings({ mode = "active", sellerId } = {}) {
     auctionQuery = auctionQuery
       .eq("status", "published")
       .gt("closes_at", new Date().toISOString());
-  } else if (mode === "cancelled") {
-    auctionQuery = auctionQuery.eq("status", "cancelled");
   } else if (mode === "seller") {
     if (!sellerId) throw new Error("Sign in to load your listings.");
-    auctionQuery = auctionQuery.eq("seller_id", sellerId);
+    auctionQuery = auctionQuery
+      .eq("seller_id", sellerId)
+      .neq("status", "cancelled");
   } else {
     throw new Error("Unsupported auction listing query.");
   }
@@ -263,6 +263,7 @@ function NavButton({ children, onClick, className = "", disabled = false }) {
 
 function App() {
   const listingRequestId = useRef(0);
+  const contactRequestId = useRef(0);
   const notificationControlRef = useRef(null);
   const [page, setPage] = useState(() =>
     window.location.pathname.replace(/\/+$/, "") === "/reset-password"
@@ -300,6 +301,10 @@ function App() {
   const [authIntent, setAuthIntent] = useState("buy");
   const [selectedItem, setSelectedItem] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [auctionContact, setAuctionContact] = useState(null);
+  const [auctionContactLoading, setAuctionContactLoading] = useState(false);
+  const [auctionContactError, setAuctionContactError] = useState("");
+  const [resultActionBusy, setResultActionBusy] = useState(false);
   const [bidBusy, setBidBusy] = useState(false);
   const [listingBusy, setListingBusy] = useState(false);
   const [photoFiles, setPhotoFiles] = useState([]);
@@ -320,6 +325,17 @@ function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationActionBusy, setNotificationActionBusy] = useState(false);
   const [notificationRefresh, setNotificationRefresh] = useState(0);
+  const [chatConversations, setChatConversations] = useState([]);
+  const [chatConversationsLoading, setChatConversationsLoading] = useState(false);
+  const [chatConversationId, setChatConversationId] = useState(null);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatMessagesLoading, setChatMessagesLoading] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatRequestKey, setChatRequestKey] = useState(null);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatFeedback, setChatFeedback] = useState(null);
+  const [chatRefresh, setChatRefresh] = useState(0);
 
   const [loginName, setLoginName] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
@@ -454,12 +470,9 @@ function App() {
         .in("id", auctionIds);
 
       if (page === "my-listings" && currentUserId) {
-        currentAuctionsQuery = currentAuctionsQuery.eq(
-          "seller_id",
-          currentUserId,
-        );
-      } else if (page === "cancelled-history") {
-        currentAuctionsQuery = currentAuctionsQuery.eq("status", "cancelled");
+        currentAuctionsQuery = currentAuctionsQuery
+          .eq("seller_id", currentUserId)
+          .neq("status", "cancelled");
       } else {
         currentAuctionsQuery = currentAuctionsQuery
           .eq("status", "published")
@@ -565,6 +578,161 @@ function App() {
   }, [currentUserId, notificationRefresh]);
 
   useEffect(() => {
+    let active = true;
+    const auctionId = selectedItem?.id;
+    const auctionSellerId = selectedItem?.sellerId;
+    const auctionStatus = selectedItem?.status;
+    const auctionEndsAt = selectedItem?.endsAt;
+
+    if (!auctionId || !currentUserId) return undefined;
+
+    if (
+      auctionStatus !== "PUBLISHED" ||
+      Date.now() >= auctionEndsAt
+    ) {
+      return undefined;
+    }
+
+    async function loadSellerConversations() {
+      setChatConversationsLoading(true);
+      try {
+        const { data, error } = await supabase.rpc(
+          "list_auction_chat_conversations",
+          { p_auction_id: auctionId },
+        );
+        if (error) throw error;
+        if (!active) return;
+
+        const conversations = data || [];
+        setChatConversations(conversations);
+        setChatConversationId((current) =>
+          conversations.some((entry) => entry.conversation_id === current)
+            ? current
+            : conversations[0]?.conversation_id || null,
+        );
+        setChatError("");
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not load auction chat conversations.", error);
+        setChatError(
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Conversations could not be loaded. Please try again.",
+        );
+      } finally {
+        if (active) setChatConversationsLoading(false);
+      }
+    }
+
+    async function openBuyerConversation() {
+      setChatConversationsLoading(true);
+      try {
+        const { data, error } = await supabase.rpc("open_auction_chat", {
+          p_auction_id: auctionId,
+        });
+        if (error) throw error;
+        if (!active) return;
+
+        const conversationId = data?.[0]?.conversation_id;
+        if (!conversationId) {
+          throw new Error("The conversation could not be opened.");
+        }
+        setChatConversationId(conversationId);
+        setChatError("");
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not open the auction chat.", error);
+        setChatError(
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Chat could not be opened. Please try again.",
+        );
+      } finally {
+        if (active) setChatConversationsLoading(false);
+      }
+    }
+
+    const loadConversation = auctionSellerId === currentUserId
+      ? loadSellerConversations
+      : openBuyerConversation;
+
+    void loadConversation();
+    const interval = setInterval(() => {
+      if (Date.now() >= auctionEndsAt) {
+        clearInterval(interval);
+        return;
+      }
+      void loadConversation();
+    }, 20000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [
+    selectedItem?.id,
+    selectedItem?.sellerId,
+    selectedItem?.status,
+    selectedItem?.endsAt,
+    currentUserId,
+  ]);
+
+  useEffect(() => {
+    let active = true;
+    let firstLoad = true;
+    const auctionId = selectedItem?.id;
+    const auctionEndsAt = selectedItem?.endsAt;
+    const conversationId = chatConversationId;
+
+    if (!auctionId || !conversationId || !currentUserId) return undefined;
+
+    async function loadMessages() {
+      try {
+        if (firstLoad) setChatMessagesLoading(true);
+        const { data, error } = await supabase.rpc("read_auction_chat", {
+          p_conversation_id: conversationId,
+        });
+        if (error) throw error;
+        if (active) {
+          setChatMessages(data || []);
+          setChatError("");
+        }
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not load auction chat messages.", error);
+        setChatError(
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Messages could not be loaded. Please try again.",
+        );
+      } finally {
+        firstLoad = false;
+        if (active) setChatMessagesLoading(false);
+      }
+    }
+
+    void loadMessages();
+    const interval = setInterval(() => {
+      if (Date.now() >= auctionEndsAt) {
+        clearInterval(interval);
+        return;
+      }
+      void loadMessages();
+    }, 12000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [
+    selectedItem?.id,
+    selectedItem?.endsAt,
+    chatConversationId,
+    currentUserId,
+    chatRefresh,
+  ]);
+
+  useEffect(() => {
     function handleNotificationDismiss(event) {
       if (!notificationControlRef.current?.contains(event.target)) {
         setNotificationsOpen(false);
@@ -637,6 +805,58 @@ function App() {
     }
   }
 
+  async function sendAuctionChatMessage(event) {
+    event.preventDefault();
+    if (chatSending || !chatConversationId || !selectedItem) return;
+
+    const message = chatDraft.trim();
+    if (!message || message.length > 500) {
+      setChatFeedback({
+        kind: "error",
+        message: "Enter a message using 1 to 500 characters.",
+      });
+      return;
+    }
+
+    if (!user) {
+      setChatFeedback({
+        kind: "error",
+        message: "Sign in before sending a message.",
+      });
+      return;
+    }
+
+    const requestKey = chatRequestKey || crypto.randomUUID();
+    setChatRequestKey(requestKey);
+    setChatSending(true);
+    setChatFeedback(null);
+    try {
+      const { error } = await supabase.rpc("send_auction_chat_message", {
+        p_conversation_id: chatConversationId,
+        p_message: message,
+        p_idempotency_key: requestKey,
+      });
+      if (error) throw error;
+
+      setChatDraft("");
+      setChatRequestKey(null);
+      setChatFeedback({ kind: "success", message: "Message sent." });
+      setChatRefresh((count) => count + 1);
+      setNotificationRefresh((count) => count + 1);
+    } catch (error) {
+      console.error("Could not send an auction chat message.", error);
+      setChatFeedback({
+        kind: "error",
+        message:
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Your message could not be sent. Please try again.",
+      });
+    } finally {
+      setChatSending(false);
+    }
+  }
+
   async function refreshListings(mode = "active") {
     const requestId = ++listingRequestId.current;
     setItemsLoading(true);
@@ -669,11 +889,9 @@ function App() {
     const listingMode =
       nextPage === "my-listings"
         ? "seller"
-        : nextPage === "cancelled-history"
-          ? "cancelled"
-          : ["home", "browse"].includes(nextPage)
-            ? "active"
-            : null;
+        : ["home", "browse"].includes(nextPage)
+          ? "active"
+          : null;
     if (listingMode) {
       void refreshListings(listingMode);
     } else {
@@ -834,8 +1052,21 @@ function App() {
     }
   }
 
-  async function openItem(item) {
+  async function openItem(item, { allowClosed = false } = {}) {
+    const contactRequest = ++contactRequestId.current;
     setSelectedItem(null);
+    setChatConversations([]);
+    setChatConversationId(null);
+    setChatMessages([]);
+    setChatConversationsLoading(false);
+    setChatMessagesLoading(false);
+    setChatError("");
+    setChatDraft("");
+    setChatRequestKey(null);
+    setChatFeedback(null);
+    setAuctionContact(null);
+    setAuctionContactError("");
+    setAuctionContactLoading(false);
     setDetailLoading(true);
     try {
       const latestItem = await fetchListingById(item.id);
@@ -853,6 +1084,7 @@ function App() {
       const onBuyerScreen = ["home", "browse"].includes(page);
       if (
         onBuyerScreen &&
+        !allowClosed &&
         (latestItem.status !== "PUBLISHED" || latestItem.endsAt <= Date.now())
       ) {
         setItems((previous) =>
@@ -867,11 +1099,121 @@ function App() {
       );
       setSelectedItem(latestItem);
       setBidAmount(String(minimumNextBid(latestItem)));
+
+      if (
+        user &&
+        ["APPROVED", "COMPLETED"].includes(latestItem.status)
+      ) {
+        setAuctionContactLoading(true);
+        try {
+          const { data, error } = await supabase.rpc("get_auction_contact", {
+            p_auction_id: item.id,
+          });
+          if (contactRequest !== contactRequestId.current) return;
+          if (error) throw error;
+
+          const contact = data?.[0];
+          setAuctionContact(
+            contact
+              ? {
+                  auctionId: item.id,
+                  email: contact.contact_email,
+                  displayName: contact.contact_display_name,
+                  role: contact.contact_role,
+                }
+              : null,
+          );
+          if (!contact) {
+            setAuctionContactError(
+              "Contact details are available only to the seller and approved winning bidder.",
+            );
+          }
+        } catch (error) {
+          if (contactRequest !== contactRequestId.current) return;
+          console.error("Could not retrieve approved auction contact details.", error);
+          setAuctionContactError("Contact details could not be loaded. Please try again.");
+        } finally {
+          if (contactRequest === contactRequestId.current) {
+            setAuctionContactLoading(false);
+          }
+        }
+      }
     } catch (error) {
       console.error("Could not load the latest auction details.", error);
       flash("Auction details could not be verified. Please try again.");
     } finally {
-      setDetailLoading(false);
+      if (contactRequest === contactRequestId.current) {
+        setDetailLoading(false);
+      }
+    }
+  }
+
+  async function openNotificationAuction(notification) {
+    if (!notification.auction_id) {
+      flash("This auction is no longer available.");
+      return;
+    }
+
+    await markNotificationRead(notification.id);
+    setNotificationsOpen(false);
+    await openItem(
+      { id: notification.auction_id },
+      { allowClosed: true },
+    );
+  }
+
+  async function closeAuctionForReview(item) {
+    if (resultActionBusy) return;
+
+    setResultActionBusy(true);
+    try {
+      const { error } = await supabase.rpc("close_auction_for_review", {
+        p_auction_id: item.id,
+      });
+      if (error) throw error;
+
+      setNotificationRefresh((count) => count + 1);
+      await openItem({ id: item.id }, { allowClosed: true });
+      flash("Auction result is ready for your review.");
+    } catch (error) {
+      console.error("Could not close auction for result review.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "Auction result could not be opened for review.",
+      );
+    } finally {
+      setResultActionBusy(false);
+    }
+  }
+
+  async function decideAuctionResult(item, approve) {
+    if (resultActionBusy) return;
+
+    setResultActionBusy(true);
+    try {
+      const { error } = await supabase.rpc("decide_auction_result", {
+        p_auction_id: item.id,
+        p_approve: approve,
+      });
+      if (error) throw error;
+
+      setNotificationRefresh((count) => count + 1);
+      await openItem({ id: item.id }, { allowClosed: true });
+      flash(
+        approve
+          ? "Result approved. Both parties can now view each other's contact email."
+          : "Result rejected. Contact details remain private.",
+      );
+    } catch (error) {
+      console.error("Could not save the auction result decision.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "Your result decision could not be saved.",
+      );
+    } finally {
+      setResultActionBusy(false);
     }
   }
 
@@ -1266,7 +1608,7 @@ function App() {
 
     if (
       !window.confirm(
-        `Cancel "${item.title}"?\n\nThis immediately ends the auction and invalidates its result. Existing bids will remain in the public history, and all bidders will be notified. This cannot be undone.`,
+        `Cancel "${item.title}"?\n\nThis immediately ends the auction and invalidates its result. Bidders will be notified, and bid/notification records are retained for 24 hours. The cancelled auction and its bids will then be permanently deleted. This cannot be undone.`,
       )
     ) {
       return;
@@ -1290,20 +1632,14 @@ function App() {
       setCancellingAuctionId(null);
     }
 
-    setItems((previous) =>
-      previous.map((entry) =>
-        entry.id === itemId
-          ? { ...entry, status: "CANCELLED" }
-          : entry,
-      ),
-    );
+    setItems((previous) => previous.filter((entry) => entry.id !== itemId));
     setSelectedItem((previous) =>
-      previous?.id === itemId ? { ...previous, status: "CANCELLED" } : previous,
+      previous?.id === itemId ? null : previous,
     );
     flash(
       item.bids.length
-        ? "Auction cancelled. Bid history is preserved and bidders have been notified."
-        : "Your auction has been cancelled.",
+        ? "Auction cancelled. Bidders were notified; the auction and bids will be permanently removed after 24 hours."
+        : "Auction cancelled. It will be permanently removed after 24 hours.",
     );
   }
 
@@ -1324,6 +1660,10 @@ function App() {
       );
       if (beginError) throw beginError;
       deletionStarted = true;
+      setItems((previous) => previous.filter((entry) => entry.id !== item.id));
+      setSelectedItem((previous) =>
+        previous?.id === item.id ? { ...previous, status: "CANCELLED" } : previous,
+      );
 
       const paths = photoPaths || [];
       const filesByFolder = new Map();
@@ -1377,13 +1717,7 @@ function App() {
       flash("Listing and its photos were deleted.");
 
       try {
-        await refreshListings(
-          page === "my-listings"
-            ? "seller"
-            : page === "cancelled-history"
-              ? "cancelled"
-              : "active",
-        );
+        await refreshListings(page === "my-listings" ? "seller" : "active");
       } catch (refreshError) {
         console.error("Listing deleted, but refreshing auctions failed.", refreshError);
         flash("Listing deleted, but the latest auctions could not be refreshed.");
@@ -1450,13 +1784,21 @@ function App() {
   const sellerItems =
     itemsLoading || itemsError
       ? []
-      : items.filter((item) => item.sellerId === user?.id);
+      : items.filter(
+          (item) =>
+            item.sellerId === user?.id && item.status !== "CANCELLED",
+        );
 
   const isSelectedAuctionOwner = Boolean(
     user &&
       selectedItem &&
       String(user.id).toLowerCase() ===
         String(selectedItem.sellerId).toLowerCase(),
+  );
+  const isSelectedChatAvailable = Boolean(
+    selectedItem &&
+      selectedItem.status === "PUBLISHED" &&
+      now < selectedItem.endsAt,
   );
   const selectedDeletionPending = selectedItem
     ? deletionPendingIds.has(selectedItem.id)
@@ -1493,9 +1835,6 @@ function App() {
 
         <nav className="nav-links">
           <NavButton onClick={() => go("browse")}>Buy items</NavButton>
-          <NavButton onClick={() => go("cancelled-history")}>
-            Cancelled history
-          </NavButton>
           <NavButton onClick={() => user ? go("sell") : requestLogin("sell")}>
             Sell items
           </NavButton>
@@ -1576,6 +1915,23 @@ function App() {
                             <time dateTime={notification.created_at}>
                               {new Date(notification.created_at).toLocaleString()}
                             </time>
+                            {notification.auction_id && (
+                              <button
+                                type="button"
+                                className="notification-mark-all"
+                                onClick={() =>
+                                  openNotificationAuction(notification)
+                                }
+                              >
+                                {notification.notification_type === "result_pending"
+                                  ? "View provisional result"
+                                  : notification.notification_type === "result_approved"
+                                    ? "View result and contacts"
+                                    : notification.notification_type === "auction_chat_message"
+                                      ? "Open chat"
+                                      : "View auction"}
+                              </button>
+                            )}
                             {!notification.is_read && (
                               <button
                                 type="button"
@@ -1782,49 +2138,6 @@ function App() {
                 <span>🔎</span>
                 <h3>No active auctions match</h3>
                 <p>Try changing your search or filters.</p>
-              </div>
-            )}
-          </section>
-        )}
-
-        {page === "cancelled-history" && (
-          <section className="marketplace page-section">
-            <div className="section-heading">
-              <div>
-                <span className="eyebrow">PUBLIC RECORD</span>
-                <h1>Cancelled Auction History</h1>
-                <p className="subheading">
-                  Cancelled auctions are not open for bidding. Existing bid
-                  records remain available for review.
-                </p>
-              </div>
-              <button className="secondary-button" onClick={() => go("browse")}>
-                Back to active auctions
-              </button>
-            </div>
-            {itemsLoading ? (
-              <p className="results-count">Loading cancelled auction history...</p>
-            ) : itemsError ? (
-              <div className="empty-state" role="alert">
-                <h3>History is unavailable</h3>
-                <p>{itemsError}</p>
-              </div>
-            ) : items.length === 0 ? (
-              <div className="empty-state">
-                <h3>No cancelled auctions</h3>
-                <p>Cancelled listings will appear here for recordkeeping.</p>
-              </div>
-            ) : (
-              <div className="product-grid">
-                {items.map((item) => (
-                  <ProductCard
-                    key={item.id}
-                    item={item}
-                    now={now}
-                    countdown={countdown}
-                    onOpen={() => openItem(item)}
-                  />
-                ))}
               </div>
             )}
           </section>
@@ -2321,14 +2634,15 @@ function App() {
         <div className="modal-backdrop" onClick={() => setSelectedItem(null)}>
           <section className="detail-modal" onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" aria-label="Close" onClick={() => setSelectedItem(null)}>×</button>
-            <div className="detail-art" style={{ backgroundColor: selectedItem.color }}>
-              {selectedItem.photoUrls.length ? (
-                <img src={selectedItem.photoUrls[0]} alt={selectedItem.title} />
-              ) : (
-                <span>{selectedItem.emoji}</span>
-              )}
-            </div>
-            <div className="detail-content">
+            <div className="detail-product">
+              <div className="detail-art" style={{ backgroundColor: selectedItem.color }}>
+                {selectedItem.photoUrls.length ? (
+                  <img src={selectedItem.photoUrls[0]} alt={selectedItem.title} />
+                ) : (
+                  <span>{selectedItem.emoji}</span>
+                )}
+              </div>
+              <div className="detail-content">
               <span className="eyebrow">{selectedItem.category} · {selectedItem.condition}</span>
               <h2>{selectedItem.title}</h2>
               <p>{selectedItem.description}</p>
@@ -2353,7 +2667,9 @@ function App() {
                 <span>
                   Closes in: {selectedItem.status === "CANCELLED"
                     ? "Cancelled"
-                    : countdown(selectedItem.endsAt)}
+                    : selectedItem.status !== "PUBLISHED" || now >= selectedItem.endsAt
+                      ? "Ended"
+                      : countdown(selectedItem.endsAt)}
                 </span>
                 {selectedItem.status === "PUBLISHED" && now < selectedItem.endsAt && (
                   <span>
@@ -2366,6 +2682,45 @@ function App() {
                   This auction was cancelled by the seller. It is no longer
                   accepting bids; all recorded bids remain in the public history.
                 </p>
+              )}
+              {selectedItem.status === "AWAITING_SELLER_DECISION" && (
+                <p className="form-notice" role="status">
+                  Provisional highest bid: {money(leadingBid(selectedItem))}.
+                  Seller approval is pending. Contact details remain private
+                  until the result is approved.
+                </p>
+              )}
+              {selectedItem.status === "ENDED_NO_BIDS" && (
+                <p className="form-notice" role="status">
+                  This auction ended without bids. No winner was selected.
+                </p>
+              )}
+              {["APPROVED", "COMPLETED"].includes(selectedItem.status) && user && (
+                <section className="auction-contact">
+                  <h3>Handover contact</h3>
+                  {auctionContactLoading ? (
+                    <p className="muted">Checking approved contact access...</p>
+                  ) : auctionContact?.auctionId === selectedItem.id ? (
+                    <>
+                      <p>
+                        {auctionContact.displayName} ({auctionContact.role})
+                        <br />
+                        {auctionContact.email}
+                      </p>
+                      <a
+                        className="primary-button contact-email-button"
+                        href={`mailto:${auctionContact.email}?subject=${encodeURIComponent(`Campus Auction: ${selectedItem.title}`)}`}
+                      >
+                        Contact {auctionContact.role === "seller" ? "Seller" : "Buyer"} →
+                      </a>
+                    </>
+                  ) : (
+                    <p className={auctionContactError ? "form-notice" : "muted"}>
+                      {auctionContactError ||
+                        "Contact details are available to the seller and approved winning bidder."}
+                    </p>
+                  )}
+                </section>
               )}
 
               <h3>Public bid history</h3>
@@ -2495,6 +2850,18 @@ function App() {
                           ? "Cancelling auction..."
                           : "Cancel auction"}
                       </button>
+                      {now >= selectedItem.endsAt && (
+                        <button
+                          className="primary-button full-button"
+                          type="button"
+                          disabled={resultActionBusy || detailLoading}
+                          onClick={() => closeAuctionForReview(selectedItem)}
+                        >
+                          {resultActionBusy
+                            ? "Reviewing auction result..."
+                            : "Close auction and review result"}
+                        </button>
+                      )}
                       {detailLoading ? (
                         <button className="delete-listing-button" type="button" disabled>
                           Checking whether this listing can be deleted...
@@ -2518,6 +2885,37 @@ function App() {
                         </p>
                       )}
                     </>
+                  ) : selectedItem.status === "AWAITING_SELLER_DECISION" ? (
+                    <>
+                      <p className="form-notice">
+                        Review the provisional result. Approving confirms the
+                        outcome and shares contact emails with the winning buyer.
+                      </p>
+                      <button
+                        className="primary-button full-button"
+                        type="button"
+                        disabled={resultActionBusy}
+                        onClick={() =>
+                          decideAuctionResult(selectedItem, true)
+                        }
+                      >
+                        {resultActionBusy ? "Saving decision..." : "Approve result"}
+                      </button>
+                      <button
+                        className="cancel-listing-button"
+                        type="button"
+                        disabled={resultActionBusy}
+                        onClick={() =>
+                          decideAuctionResult(selectedItem, false)
+                        }
+                      >
+                        {resultActionBusy ? "Saving decision..." : "Reject result"}
+                      </button>
+                    </>
+                  ) : selectedItem.status === "ENDED_NO_BIDS" ? (
+                    <p className="form-notice">
+                      This auction ended without bids. No winner was selected.
+                    </p>
                   ) : selectedItem.status !== "CANCELLED" ? (
                     <p className="form-notice">
                       This auction is {selectedItem.status.toLowerCase()} and
@@ -2534,7 +2932,164 @@ function App() {
                   )}
                 </div>
               )}
+              </div>
             </div>
+            <aside className="auction-chat" aria-labelledby="auction-chat-heading">
+              <header className="auction-chat-header">
+                <span className="eyebrow">Private auction chat</span>
+                <h3 id="auction-chat-heading">{selectedItem.title}</h3>
+                <p>
+                  Only you and the listing seller can read this conversation.
+                  Chat closes when the auction ends.
+                </p>
+              </header>
+
+              {isSelectedChatAvailable ? (
+                <>
+                  {!user ? (
+                    <div className="auction-chat-empty">
+                      <p>Sign in to message the seller about this item.</p>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => {
+                          setSelectedItem(null);
+                          requestLogin("buy");
+                        }}
+                      >
+                        Sign in
+                      </button>
+                    </div>
+                  ) : isSelectedAuctionOwner ? (
+                    chatConversationsLoading && !chatConversations.length ? (
+                      <p className="muted" role="status">Loading conversations...</p>
+                    ) : chatConversations.length ? (
+                      <label className="auction-chat-conversation-picker">
+                        Buyer conversation
+                        <select
+                          value={chatConversationId || ""}
+                          onChange={(event) => {
+                            setChatConversationId(event.target.value || null);
+                            setChatMessages([]);
+                            setChatDraft("");
+                            setChatRequestKey(null);
+                            setChatFeedback(null);
+                            setChatError("");
+                          }}
+                        >
+                          {chatConversations.map((conversation) => (
+                            <option
+                              key={conversation.conversation_id}
+                              value={conversation.conversation_id}
+                            >
+                              {conversation.buyer_display_name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : (
+                      <p className="auction-chat-empty">
+                        {chatError || "No conversations yet. Buyers can message while this auction is open."}
+                      </p>
+                    )
+                  ) : chatConversationsLoading ? (
+                    <p className="muted" role="status">Opening your conversation...</p>
+                  ) : chatError ? (
+                    <p className="form-notice" role="alert">{chatError}</p>
+                  ) : null}
+
+                  {user && chatConversationId && (
+                    <>
+                      {chatError && (
+                        <p className="form-notice" role="alert">{chatError}</p>
+                      )}
+                      <div className="auction-chat-history" role="log" aria-live="polite">
+                        {chatMessagesLoading ? (
+                          <p className="muted" role="status">Loading messages...</p>
+                        ) : chatMessages.length === 0 ? (
+                          <p className="auction-chat-empty">
+                            No messages yet. Start the conversation about this item.
+                          </p>
+                        ) : (
+                          chatMessages.map((message) => (
+                            <article
+                              className={`auction-chat-message${message.is_mine ? " is-mine" : ""}`}
+                              key={message.message_id}
+                            >
+                              <span>
+                                {message.is_mine
+                                  ? "You"
+                                  : isSelectedAuctionOwner
+                                    ? chatConversations.find(
+                                        (entry) =>
+                                          entry.conversation_id === chatConversationId,
+                                      )?.buyer_display_name || "Buyer"
+                                    : "Seller"}
+                              </span>
+                              <p>{message.message_text}</p>
+                              <time dateTime={message.created_at}>
+                                {new Date(message.created_at).toLocaleString()}
+                              </time>
+                            </article>
+                          ))
+                        )}
+                      </div>
+
+                      {chatFeedback && (
+                        <p
+                          className={
+                            chatFeedback.kind === "error"
+                              ? "form-notice"
+                              : "auction-chat-success"
+                          }
+                          role={chatFeedback.kind === "error" ? "alert" : "status"}
+                        >
+                          {chatFeedback.message}
+                        </p>
+                      )}
+
+                      <form
+                        className="auction-chat-form"
+                        onSubmit={sendAuctionChatMessage}
+                      >
+                        <label htmlFor="auction-chat-input">Message</label>
+                        <textarea
+                          id="auction-chat-input"
+                          maxLength={500}
+                          rows={3}
+                          required
+                          value={chatDraft}
+                          onChange={(event) => {
+                            setChatDraft(event.target.value);
+                            setChatRequestKey(null);
+                          }}
+                          disabled={chatSending}
+                          placeholder="Write a message (up to 500 characters)"
+                        />
+                        <div className="auction-chat-form-footer">
+                          <span>{chatDraft.length}/500</span>
+                          <button
+                            className="primary-button"
+                            type="submit"
+                            disabled={
+                              chatSending ||
+                              !chatConversationId ||
+                              !chatDraft.trim()
+                            }
+                          >
+                            {chatSending ? "Sending..." : "Send"}
+                          </button>
+                        </div>
+                      </form>
+                    </>
+                  )}
+                </>
+              ) : (
+                <p className="auction-chat-empty" role="status">
+                  Chat is unavailable because this auction is no longer open.
+                </p>
+              )}
+            </aside>
           </section>
         </div>
       )}
