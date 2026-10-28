@@ -1,71 +1,28 @@
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { supabase } from "./supabase.js";
 import "./App.css";
 
-const initialItems = [
-  {
-    id: "1",
-    title: "Mountain Bicycle",
-    category: "Cycle",
-    condition: "Good",
-    description: "A reliable bicycle for daily campus travel.",
-    price: 2500,
-    increment: 100,
-    endsAt: Date.now() + 5 * 60 * 60 * 1000,
-    emoji: "🚲",
-    color: "#e2f3e6",
-    seller: "Campus Seller",
-    bids: [],
-    status: "ACTIVE",
-  },
-  {
-    id: "2",
-    title: "Casio Scientific Calculator",
-    category: "Calculator",
-    condition: "Like New",
-    description: "Scientific calculator in excellent working condition.",
-    price: 650,
-    increment: 50,
-    endsAt: Date.now() + 3 * 60 * 60 * 1000,
-    emoji: "🧮",
-    color: "#e8ebff",
-    seller: "Campus Seller",
-    bids: [],
-    status: "ACTIVE",
-  },
-  {
-    id: "3",
-    title: "Engineering Mathematics Books",
-    category: "Books",
-    condition: "Good",
-    description: "Useful reference books for engineering students.",
-    price: 300,
-    increment: 25,
-    endsAt: Date.now() + 90 * 60 * 1000,
-    emoji: "📚",
-    color: "#fff0d9",
-    seller: "Campus Seller",
-    bids: [],
-    status: "ACTIVE",
-  },
-  {
-    id: "4",
-    title: "Wireless Headphones",
-    category: "Electronics",
-    condition: "Good",
-    description: "Wireless headphones, ready for a new owner.",
-    price: 900,
-    increment: 50,
-    endsAt: Date.now() + 7 * 60 * 60 * 1000,
-    emoji: "🎧",
-    color: "#f4e6f5",
-    seller: "Campus Seller",
-    bids: [],
-    status: "ACTIVE",
-  },
-];
-
 const categories = ["All", "Cycle", "Calculator", "Books", "Electronics"];
+const photoBucket = "listing-photos";
+const allowedPhotoTypes = new Map([
+  ["image/jpeg", "jpg"],
+  ["image/png", "png"],
+  ["image/webp", "webp"],
+]);
+const maxPhotoSize = 5 * 1024 * 1024;
+const categoryColors = {
+  Cycle: "#e2f3e6",
+  Calculator: "#e8ebff",
+  Books: "#fff0d9",
+  Electronics: "#f4e6f5",
+};
+const categoryEmoji = {
+  Cycle: "🚲",
+  Calculator: "🧮",
+  Books: "📚",
+  Electronics: "🎧",
+};
 
 function money(amount) {
   return `₹${Number(amount).toLocaleString("en-IN")}`;
@@ -77,12 +34,131 @@ function leadingBid(item) {
     : item.price;
 }
 
+function mapBid(row) {
+  return {
+    id: row.bid_id,
+    amount: Number(row.amount),
+    createdAt: row.created_at,
+    bidderName: "Campus bidder",
+  };
+}
+
+async function createPhotoUrlMap(paths) {
+  const uniquePaths = [...new Set(paths)];
+  if (!uniquePaths.length) return new Map();
+
+  const { data, error } = await supabase.storage
+    .from(photoBucket)
+    .createSignedUrls(uniquePaths, 60 * 60 * 24 * 7);
+  if (error) throw error;
+
+  const failedPath = data.find((photo) => photo.error || !photo.signedUrl);
+  if (failedPath) {
+    throw new Error(failedPath.error || "Could not create a photo link.");
+  }
+
+  return new Map(data.map((photo) => [photo.path, photo.signedUrl]));
+}
+
+function mapAuction(row, bids, photoUrlsByPath) {
+  return {
+    id: row.id,
+    title: row.title,
+    category: row.category,
+    condition: row.item_condition,
+    description: row.description,
+    price: Number(row.starting_price),
+    increment: Number(row.min_increment),
+    endsAt: new Date(row.closes_at).getTime(),
+    emoji: categoryEmoji[row.category] || "📦",
+    color: categoryColors[row.category] || "#e2f3e6",
+    seller: row.seller_name || "Campus seller",
+    sellerId: row.seller_id,
+    photoPaths: row.photo_paths || [],
+    photoUrls: (row.photo_paths || [])
+      .map((path) => photoUrlsByPath.get(path))
+      .filter(Boolean),
+    bids,
+    status: row.status.toUpperCase(),
+  };
+}
+
+async function fetchListings() {
+  const { data: auctionRows, error: auctionsError } = await supabase
+    .from("auctions")
+    .select(
+      "id, seller_id, title, description, category, item_condition, starting_price, min_increment, closes_at, photo_paths, status",
+    )
+    .order("closes_at", { ascending: true });
+
+  if (auctionsError) throw auctionsError;
+  if (!auctionRows?.length) return [];
+
+  const auctionIds = auctionRows.map((auction) => auction.id);
+  const sellerIds = [...new Set(auctionRows.map((auction) => auction.seller_id))];
+  const photoPaths = auctionRows.flatMap((auction) => auction.photo_paths || []);
+  const [bidsResult, profilesResult, photoUrlsByPath] = await Promise.all([
+    supabase
+      .from("public_bid_history")
+      .select("bid_id, auction_id, amount, created_at")
+      .in("auction_id", auctionIds)
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("profiles")
+      .select("id, display_name")
+      .in("id", sellerIds),
+    createPhotoUrlMap(photoPaths),
+  ]);
+
+  if (bidsResult.error) throw bidsResult.error;
+  if (profilesResult.error) throw profilesResult.error;
+
+  const bidsByAuction = new Map();
+  for (const row of bidsResult.data || []) {
+    const auctionBids = bidsByAuction.get(row.auction_id) || [];
+    auctionBids.push(mapBid(row));
+    bidsByAuction.set(row.auction_id, auctionBids);
+  }
+
+  const sellerNames = new Map(
+    (profilesResult.data || []).map((profile) => [
+      profile.id,
+      profile.display_name,
+    ]),
+  );
+
+  return auctionRows.map((row) =>
+    mapAuction(
+      { ...row, seller_name: sellerNames.get(row.seller_id) },
+      bidsByAuction.get(row.id) || [],
+      photoUrlsByPath,
+    ),
+  );
+}
+
+function NavButton({ children, onClick, className = "", disabled = false }) {
+  return (
+    <button className={className} onClick={onClick} disabled={disabled}>
+      {children}
+    </button>
+  );
+}
+
 function App() {
   const [page, setPage] = useState("home");
-  const [items, setItems] = useState(initialItems);
+  const [items, setItems] = useState([]);
   const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authMode, setAuthMode] = useState("signin");
+  const [itemsLoading, setItemsLoading] = useState(true);
+  const [itemsError, setItemsError] = useState("");
   const [authIntent, setAuthIntent] = useState("buy");
   const [selectedItem, setSelectedItem] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [bidBusy, setBidBusy] = useState(false);
+  const [listingBusy, setListingBusy] = useState(false);
+  const [photoFiles, setPhotoFiles] = useState([]);
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All");
   const [condition, setCondition] = useState("All");
@@ -94,6 +170,10 @@ function App() {
   const [loginName, setLoginName] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const photoPreviews = useMemo(
+    () => photoFiles.map((file) => URL.createObjectURL(file)),
+    [photoFiles],
+  );
 
   const [form, setForm] = useState({
     title: "",
@@ -112,6 +192,99 @@ function App() {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (active) setUser(session?.user || null);
+    });
+
+    supabase.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!active) return;
+        if (error) {
+          console.error("Could not restore the Supabase session.", error);
+          flash("Could not restore your sign-in. Please sign in again.");
+        }
+        setUser(data.session?.user || null);
+        setAuthLoading(false);
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error("Could not restore the Supabase session.", error);
+        setAuthLoading(false);
+        flash("Could not restore your sign-in. Please sign in again.");
+      });
+
+    async function loadAuctions() {
+      setItemsLoading(true);
+      setItemsError("");
+      try {
+        const listings = await fetchListings();
+        if (active) setItems(listings);
+      } catch (error) {
+        console.error("Could not load Supabase auctions.", error);
+        if (active) setItemsError("Auctions could not be loaded. Please try again.");
+      } finally {
+        if (active) setItemsLoading(false);
+      }
+    }
+
+    void loadAuctions();
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(
+    () => () => photoPreviews.forEach((url) => URL.revokeObjectURL(url)),
+    [photoPreviews],
+  );
+
+  useEffect(() => {
+    const auctionId = selectedItem?.id;
+    if (!auctionId) return undefined;
+    let active = true;
+
+    supabase
+      .from("public_bid_history")
+      .select("bid_id, auction_id, amount, created_at")
+      .eq("auction_id", auctionId)
+      .order("created_at", { ascending: false })
+      .then(({ data, error }) => {
+        if (!active) return;
+        if (error) {
+          console.error("Could not load public bid history.", error);
+          flash("Bid history could not be loaded.");
+          return;
+        }
+        const bids = (data || []).map(mapBid);
+        setItems((previous) =>
+          previous.map((item) =>
+            item.id === auctionId ? { ...item, bids } : item,
+          ),
+        );
+        setSelectedItem((current) =>
+          current?.id === auctionId ? { ...current, bids } : current,
+        );
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error("Could not request public bid history.", error);
+        flash("Bid history could not be loaded.");
+      })
+      .finally(() => {
+        if (active) setDetailLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedItem?.id]);
+
   function flash(message) {
     setNotice(message);
     setTimeout(() => setNotice(""), 3500);
@@ -126,46 +299,79 @@ function App() {
 
   function requestLogin(intent) {
     setAuthIntent(intent);
+    setAuthMode("signin");
     setPage("login");
   }
 
-  // Temporary frontend-only sign-in for interface testing.
-  // Replace this with real backend authentication before deployment.
-  function handleDemoLogin(event) {
+  async function handleAuth(event) {
     event.preventDefault();
 
-    if (!loginEmail.trim() || !loginPassword.trim()) {
+    const email = loginEmail.trim();
+    if (!email || !loginPassword) {
       flash("Enter your email and password.");
       return;
     }
 
-    setUser({
-      id: loginEmail.trim().toLowerCase(),
-      name: loginName.trim() || loginEmail.split("@")[0],
-      email: loginEmail.trim(),
-    });
+    setAuthBusy(true);
+    try {
+      if (authMode === "signup") {
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password: loginPassword,
+          options: {
+            data: { display_name: loginName.trim() || email.split("@")[0] },
+          },
+        });
+        if (error) throw error;
 
-    if (authIntent === "sell") {
-      go("sell");
-    } else {
-      go("browse");
+        if (!data.session) {
+          setLoginPassword("");
+          flash("Check your email to confirm your account, then sign in.");
+          setAuthMode("signin");
+          return;
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email,
+          password: loginPassword,
+        });
+        if (error) throw error;
+      }
+
+      setLoginPassword("");
+      go(authIntent === "sell" ? "sell" : "browse");
+      flash(authMode === "signup" ? "Your account is ready." : "You are signed in.");
+    } catch (error) {
+      console.error("Supabase authentication failed.", error);
+      flash(
+        authMode === "signup"
+          ? "Account creation failed. Check your details and try again."
+          : "Sign-in failed. Check your email and password.",
+      );
+    } finally {
+      setAuthBusy(false);
     }
-
-    flash("Demo sign-in successful. Connect real authentication before launch.");
   }
 
-  function handleLogout() {
-    setUser(null);
-    go("home");
-    flash("You have signed out of the demo.");
+  async function handleLogout() {
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      go("home");
+      flash("You have signed out.");
+    } catch (error) {
+      console.error("Supabase sign-out failed.", error);
+      flash("Sign-out failed. Please try again.");
+    }
   }
 
-  function openItem(item) {
+  async function openItem(item) {
+    setDetailLoading(true);
     setSelectedItem(item);
     setBidAmount(String(leadingBid(item) + item.increment));
   }
 
-  function placeBid(event) {
+  async function placeBid(event) {
     event.preventDefault();
 
     if (!user) {
@@ -178,7 +384,7 @@ function App() {
     const item = items.find((entry) => entry.id === selectedItem?.id);
     const amount = Number(bidAmount);
 
-    if (!item || item.status !== "ACTIVE" || now >= item.endsAt) {
+    if (!item || item.status !== "PUBLISHED" || now >= item.endsAt) {
       flash("This auction has closed.");
       setSelectedItem(null);
       return;
@@ -198,31 +404,72 @@ function App() {
       return;
     }
 
-    setItems((previous) =>
-      previous.map((entry) =>
-        entry.id === item.id
-          ? {
-              ...entry,
-              bids: [
-                ...entry.bids,
-                {
-                  id: crypto.randomUUID(),
-                  bidderId: user.id,
-                  bidderName: user.name,
-                  amount,
-                  createdAt: Date.now(),
-                },
-              ],
-            }
-          : entry
-      )
-    );
+    setBidBusy(true);
+    let error;
+    try {
+      ({ error } = await supabase.rpc("place_bid", {
+        p_auction_id: item.id,
+        p_amount: amount,
+      }));
+    } catch (requestError) {
+      console.error("Could not send the bid request.", requestError);
+      flash("The bid could not be sent. Check your connection and try again.");
+      setBidBusy(false);
+      return;
+    }
+    setBidBusy(false);
+    if (error) {
+      console.error("Supabase rejected the bid.", error);
+      flash("Your bid was rejected. Check the current minimum and auction deadline.");
+      return;
+    }
 
-    setSelectedItem(null);
-    flash("Demo bid recorded in this browser only.");
+    try {
+      const { data, error: historyError } = await supabase
+        .from("public_bid_history")
+        .select("bid_id, auction_id, amount, created_at")
+        .eq("auction_id", item.id)
+        .order("created_at", { ascending: false });
+      if (historyError) throw historyError;
+
+      const bids = (data || []).map(mapBid);
+      const updatedItem = { ...item, bids };
+      setItems((previous) =>
+        previous.map((entry) => (entry.id === item.id ? updatedItem : entry)),
+      );
+      setSelectedItem(updatedItem);
+      setBidAmount(String(leadingBid(updatedItem) + updatedItem.increment));
+      flash("Your bid was placed.");
+    } catch (error) {
+      console.error("Bid succeeded, but refreshing bid history failed.", error);
+      flash("Your bid was placed, but the latest bid history could not be loaded.");
+    }
   }
 
-  function createListing(event) {
+  function handlePhotoSelection(event) {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length > 5) {
+      flash("Choose no more than five photos.");
+      return;
+    }
+
+    const invalidFile = files.find(
+      (file) =>
+        !allowedPhotoTypes.has(file.type) ||
+        file.size > maxPhotoSize ||
+        file.size === 0,
+    );
+    if (invalidFile) {
+      flash("Use JPG, PNG or WebP photos no larger than 5 MB each.");
+      return;
+    }
+
+    setPhotoFiles(files);
+  }
+
+  async function createListing(event) {
     event.preventDefault();
 
     if (!user) {
@@ -242,70 +489,158 @@ function App() {
       !Number.isFinite(increment) ||
       increment <= 0 ||
       !Number.isFinite(hours) ||
-      hours <= 0
+      hours <= 0 ||
+      photoFiles.length > 5
     ) {
       flash("Enter valid item details, price and closing time.");
       return;
     }
 
-    const emojiByCategory = {
-      Cycle: "🚲",
-      Calculator: "🧮",
-      Books: "📚",
-      Electronics: "🎧",
-    };
+    const validPhotos = photoFiles.every(
+      (file) =>
+        allowedPhotoTypes.has(file.type) &&
+        file.size > 0 &&
+        file.size <= maxPhotoSize,
+    );
+    if (!validPhotos) {
+      flash("Remove invalid photos before publishing.");
+      return;
+    }
 
-    const newItem = {
-      id: crypto.randomUUID(),
-      title: form.title.trim(),
-      category: form.category,
-      condition: form.condition,
-      description: form.description.trim(),
-      price,
-      increment,
-      endsAt: Date.now() + hours * 60 * 60 * 1000,
-      emoji: emojiByCategory[form.category] || "📦",
-      color: "#e2f3e6",
-      seller: user.name,
-      sellerId: user.id,
-      bids: [],
-      status: "ACTIVE",
-    };
+    setListingBusy(true);
+    const photoBatchId = crypto.randomUUID();
+    const uploadedPaths = [];
+    let listingCreated = false;
+    try {
+      for (const file of photoFiles) {
+        const extension = allowedPhotoTypes.get(file.type);
+        const path = `${user.id}/${photoBatchId}/${crypto.randomUUID()}.${extension}`;
+        const { error } = await supabase.storage
+          .from(photoBucket)
+          .upload(path, file, {
+            cacheControl: "3600",
+            contentType: file.type,
+            upsert: false,
+          });
+        if (error) throw error;
+        uploadedPaths.push(path);
+      }
 
-    setItems((previous) => [newItem, ...previous]);
-    setForm({
-      title: "",
-      category: "Books",
-      condition: "Good",
-      description: "",
-      price: "",
-      increment: "50",
-      hours: "24",
-    });
+      const closesAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+      const listingData = {
+        title: form.title.trim(),
+        description: form.description.trim(),
+        category: form.category,
+        item_condition: form.condition,
+        starting_price: price,
+        min_increment: increment,
+        closes_at: closesAt,
+        photo_paths: uploadedPaths,
+      };
+      const { data: insertedAuction, error: insertError } = await supabase
+        .from("auctions")
+        .insert(listingData)
+        .select("id")
+        .single();
+      if (insertError) throw insertError;
+      listingCreated = true;
+      let photoUrlsByPath = new Map();
+      let photosAvailable = true;
+      try {
+        photoUrlsByPath = await createPhotoUrlMap(uploadedPaths);
+      } catch (photoError) {
+        photosAvailable = false;
+        console.error("Auction published, but photo links could not be created.", photoError);
+      }
 
-    go("browse");
-    flash("Demo listing created in this browser only.");
+      const createdListing = mapAuction(
+        {
+          ...listingData,
+          id: insertedAuction.id,
+          seller_id: user.id,
+          status: "published",
+          seller_name:
+            user.user_metadata?.display_name || user.email?.split("@")[0],
+        },
+        [],
+        photoUrlsByPath,
+      );
+      setItems((previous) => [createdListing, ...previous]);
+      setPhotoFiles([]);
+      setForm({
+        title: "",
+        category: "Books",
+        condition: "Good",
+        description: "",
+        price: "",
+        increment: "50",
+        hours: "24",
+      });
+      go("browse");
+      flash(
+        photosAvailable
+          ? "Your auction has been published."
+          : "Auction published. Photos could not be loaded; refresh and try again.",
+      );
+
+      try {
+        setItems(await fetchListings());
+      } catch (refreshError) {
+        console.error("Could not refresh listings after publishing.", refreshError);
+        flash("Auction published, but the latest listings could not be refreshed.");
+      }
+    } catch (error) {
+      console.error("Could not publish Supabase auction.", error);
+      if (!listingCreated && uploadedPaths.length) {
+        try {
+          const { error: cleanupError } = await supabase.storage
+            .from(photoBucket)
+            .remove(uploadedPaths);
+          if (cleanupError) {
+            console.error("Could not remove photos for the failed listing.", cleanupError);
+          }
+        } catch (cleanupError) {
+          console.error("Could not request photo cleanup.", cleanupError);
+        }
+      }
+      if (listingCreated) {
+        flash("Auction published, but the latest listings could not be refreshed.");
+      } else {
+        flash("The listing could not be published. Check the details and try again.");
+      }
+    } finally {
+      setListingBusy(false);
+    }
   }
 
-  function cancelListing(itemId) {
+  async function cancelListing(itemId) {
     const item = items.find((entry) => entry.id === itemId);
-    if (!item || item.bids.length > 0) {
-      flash("For this demo, only listings with no bids can be cancelled.");
+    if (!item) {
+      flash("This listing could not be found.");
+      return;
+    }
+
+    try {
+      const { error } = await supabase.rpc("cancel_auction", {
+        p_auction_id: itemId,
+      });
+      if (error) throw error;
+    } catch (error) {
+      console.error("Could not cancel Supabase auction.", error);
+      flash("This listing could not be cancelled. It may have received a bid or expired.");
       return;
     }
 
     setItems((previous) =>
       previous.map((entry) =>
-        entry.id === itemId
-          ? { ...entry, status: "CANCELLED" }
-          : entry
-      )
+        entry.id === itemId ? { ...entry, status: "CANCELLED" } : entry,
+      ),
     );
-    flash("Demo listing cancelled.");
+    flash("Your listing has been cancelled.");
   }
 
   const visibleItems = items.filter((item) => {
-    if (item.status !== "ACTIVE" || now >= item.endsAt) return false;
+    if (item.status !== "PUBLISHED" || now >= item.endsAt) return false;
 
     const matchesSearch =
       `${item.title} ${item.description} ${item.category}`
@@ -341,14 +676,6 @@ function App() {
     return `${hours}h ${minutes}m ${seconds}s`;
   }
 
-  function NavButton({ children, onClick, className = "" }) {
-    return (
-      <button className={className} onClick={onClick}>
-        {children}
-      </button>
-    );
-  }
-
   return (
     <div className="app">
       <header className="navbar">
@@ -370,8 +697,12 @@ function App() {
               </NavButton>
             </>
           ) : (
-            <NavButton className="nav-login" onClick={() => requestLogin("buy")}>
-              Sign in
+            <NavButton
+          className="nav-login"
+          onClick={() => requestLogin("buy")}
+          disabled={authLoading}
+            >
+          {authLoading ? "Loading..." : "Sign in"}
             </NavButton>
           )}
         </nav>
@@ -462,6 +793,10 @@ function App() {
                   />
                 ))}
               </div>
+              {!itemsLoading && !itemsError && visibleItems.length === 0 && (
+                <p className="empty-state">No published auctions yet.</p>
+              )}
+              {itemsError && <p className="form-notice">{itemsError}</p>}
             </section>
           </>
         )}
@@ -518,7 +853,15 @@ function App() {
               </label>
             </div>
 
-            <p className="results-count">{visibleItems.length} active auctions</p>
+            <p className="results-count">
+              {itemsLoading ? "Loading auctions..." : `${visibleItems.length} active auctions`}
+            </p>
+            {itemsError && (
+              <div className="empty-state" role="alert">
+                <h3>Auctions are unavailable</h3>
+                <p>{itemsError}</p>
+              </div>
+            )}
             <div className="product-grid">
               {visibleItems.map((item) => (
                 <ProductCard
@@ -530,7 +873,7 @@ function App() {
                 />
               ))}
             </div>
-            {visibleItems.length === 0 && (
+            {!itemsLoading && !itemsError && visibleItems.length === 0 && (
               <div className="empty-state">
                 <span>🔎</span>
                 <h3>No matching auctions</h3>
@@ -542,32 +885,73 @@ function App() {
 
         {page === "login" && (
           <section className="auth-page">
-            <form className="auth-card" onSubmit={handleDemoLogin}>
+            <form className="auth-card" onSubmit={handleAuth}>
               <span className="auth-icon">{authIntent === "sell" ? "📦" : "👋"}</span>
               <span className="eyebrow">WELCOME TO CAMPUS AUCTION</span>
-              <h1>{authIntent === "sell" ? "Start selling" : "Sign in to continue"}</h1>
+              <h1>
+                {authMode === "signup"
+                  ? "Create your account"
+                  : authIntent === "sell"
+                    ? "Start selling"
+                    : "Sign in to continue"}
+              </h1>
               <p>
-                {authIntent === "sell"
+                {authMode === "signup"
+                  ? "Create an account with your email and password to start bidding and selling."
+                  : authIntent === "sell"
                   ? "Sign in to create listings and manage your auctions."
                   : "You can browse without an account. Sign in when you're ready to bid."}
               </p>
-              <label>
-                Display name (optional)
-                <input value={loginName} onChange={(event) => setLoginName(event.target.value)} placeholder="Your name" />
-              </label>
+              {authMode === "signup" && (
+                <label>
+                  Display name (optional)
+                  <input
+                    maxLength="80"
+                    value={loginName}
+                    onChange={(event) => setLoginName(event.target.value)}
+                    placeholder="Your name"
+                  />
+                </label>
+              )}
               <label>
                 Email
-                <input type="email" required value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} placeholder="you@college.edu" />
+                <input
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={loginEmail}
+                  onChange={(event) => setLoginEmail(event.target.value)}
+                  placeholder="you@college.edu"
+                />
               </label>
               <label>
                 Password
-                <input type="password" required value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} placeholder="Enter password" />
+                <input
+                  type="password"
+                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+                  required
+                  minLength="6"
+                  value={loginPassword}
+                  onChange={(event) => setLoginPassword(event.target.value)}
+                  placeholder="Enter password"
+                />
               </label>
-              <button className="primary-button full-button" type="submit">
-                Continue →
+              <button className="primary-button full-button" type="submit" disabled={authBusy}>
+                {authBusy
+                  ? "Please wait..."
+                  : authMode === "signup"
+                    ? "Create account →"
+                    : "Sign in →"}
               </button>
-              <p className="demo-disclaimer">
-                Frontend preview only. This form does not verify your identity or save credentials.
+              <p className="demo-disclaimer auth-switch">
+                {authMode === "signup" ? "Already registered?" : "New to Campus Auction?"}
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => setAuthMode(authMode === "signup" ? "signin" : "signup")}
+                >
+                  {authMode === "signup" ? "Sign in" : "Create an account"}
+                </button>
               </p>
               <button className="text-button back-button" type="button" onClick={() => go("home")}>
                 ← Back to home
@@ -622,11 +1006,11 @@ function App() {
                 <div className="form-row">
                   <label>
                     Starting price (₹)
-                    <input required type="number" min="1" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} placeholder="500" />
+                    <input required type="number" min="0.01" step="0.01" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} placeholder="500" />
                   </label>
                   <label>
                     Minimum bid increment (₹)
-                    <input required type="number" min="1" value={form.increment} onChange={(event) => setForm({ ...form, increment: event.target.value })} />
+                    <input required type="number" min="0.01" step="0.01" value={form.increment} onChange={(event) => setForm({ ...form, increment: event.target.value })} />
                   </label>
                 </div>
                 <label>
@@ -640,10 +1024,45 @@ function App() {
                     <option value="72">3 days</option>
                   </select>
                 </label>
+                <label>
+                  Item photos (up to 5; JPG, PNG or WebP, max 5 MB each)
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    multiple
+                    onChange={handlePhotoSelection}
+                  />
+                </label>
+                {photoPreviews.length > 0 && (
+                  <div className="photo-preview-grid">
+                    {photoPreviews.map((url, index) => (
+                      <div className="photo-preview" key={url}>
+                        <img src={url} alt={`Selected item photo ${index + 1}`} />
+                        <button
+                          type="button"
+                          aria-label={`Remove photo ${index + 1}`}
+                          onClick={() =>
+                            setPhotoFiles((previous) =>
+                              previous.filter((_, photoIndex) => photoIndex !== index),
+                            )
+                          }
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="form-notice">
-                  Photo uploads and exact closing date/time will be connected to the backend in the next step.
+                  Your auction closes after the selected duration. Photos are visible to everyone.
                 </div>
-                <button className="primary-button full-button" type="submit">Create demo listing →</button>
+                <button
+                  className="primary-button full-button"
+                  type="submit"
+                  disabled={listingBusy}
+                >
+                  {listingBusy ? "Publishing..." : "Publish auction →"}
+                </button>
               </form>
             )}
           </section>
@@ -659,6 +1078,7 @@ function App() {
               <button className="primary-button" onClick={() => go("sell")}>+ New listing</button>
             </div>
             <div className="product-grid">
+              {itemsLoading && <p className="results-count">Loading your listings...</p>}
               {items.filter((item) => item.sellerId === user?.id).map((item) => (
                 <div className="seller-listing" key={item.id}>
                   <ProductCard
@@ -668,13 +1088,17 @@ function App() {
                     onOpen={() => openItem(item)}
                   />
                   <div className="seller-listing-actions">
-                    <span className="status-pill">{item.status}</span>
-                    <button className="text-button" onClick={() => cancelListing(item.id)}>Cancel listing</button>
+                    <span className="status-pill">{item.status.replaceAll("_", " ")}</span>
+                    {item.status === "PUBLISHED" && item.bids.length === 0 && now < item.endsAt && (
+                      <button className="text-button" onClick={() => cancelListing(item.id)}>
+                        Cancel listing
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
             </div>
-            {items.filter((item) => item.sellerId === user?.id).length === 0 && (
+            {!itemsLoading && !itemsError && items.filter((item) => item.sellerId === user?.id).length === 0 && (
               <div className="empty-state">
                 <span>📦</span>
                 <h3>No listings yet</h3>
@@ -689,7 +1113,7 @@ function App() {
       <footer className="footer">
         <button className="brand footer-brand" onClick={() => go("home")}>Campus<span className="brand-accent">Auction</span></button>
         <p>Built for campus life. Reuse more. Spend smarter.</p>
-        <span>Student marketplace · Demo frontend</span>
+        <span>Student marketplace · Supabase</span>
       </footer>
 
       {selectedItem && (
@@ -697,12 +1121,24 @@ function App() {
           <section className="detail-modal" onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" aria-label="Close" onClick={() => setSelectedItem(null)}>×</button>
             <div className="detail-art" style={{ backgroundColor: selectedItem.color }}>
-              <span>{selectedItem.emoji}</span>
+              {selectedItem.photoUrls.length ? (
+                <img src={selectedItem.photoUrls[0]} alt={selectedItem.title} />
+              ) : (
+                <span>{selectedItem.emoji}</span>
+              )}
             </div>
             <div className="detail-content">
               <span className="eyebrow">{selectedItem.category} · {selectedItem.condition}</span>
               <h2>{selectedItem.title}</h2>
               <p>{selectedItem.description}</p>
+              <p className="muted">Seller: {selectedItem.seller}</p>
+              {selectedItem.photoUrls.length > 1 && (
+                <div className="detail-photo-grid">
+                  {selectedItem.photoUrls.map((url, index) => (
+                    <img key={url} src={url} alt={`${selectedItem.title} photo ${index + 1}`} />
+                  ))}
+                </div>
+              )}
               <div className="detail-price">
                 <span>Current leading bid</span>
                 <strong>{money(leadingBid(selectedItem))}</strong>
@@ -713,7 +1149,9 @@ function App() {
               </div>
 
               <h3>Public bid history</h3>
-              {selectedItem.bids.length === 0 ? (
+              {detailLoading ? (
+                <p className="muted">Loading bid history...</p>
+              ) : selectedItem.bids.length === 0 ? (
                 <p className="muted">No bids yet. Be the first to bid!</p>
               ) : (
                 <div className="bid-history">
@@ -721,24 +1159,27 @@ function App() {
                     <div className="bid-history-row" key={bid.id}>
                       <span>{bid.bidderName}</span>
                       <strong>{money(bid.amount)}</strong>
-                      <time>{new Date(bid.createdAt).toLocaleTimeString()}</time>
+                      <time>{new Date(bid.createdAt).toLocaleString()}</time>
                     </div>
                   ))}
                 </div>
               )}
 
-              {selectedItem.status === "ACTIVE" && now < selectedItem.endsAt ? (
+              {selectedItem.status === "PUBLISHED" && now < selectedItem.endsAt ? (
                 <form className="bid-form" onSubmit={placeBid}>
                   <label htmlFor="bid-amount">Your bid (₹)</label>
-                  <input id="bid-amount" type="number" min={selectedItem.bids.length ? leadingBid(selectedItem) + selectedItem.increment : selectedItem.price} step={selectedItem.increment} required value={bidAmount} onChange={(event) => setBidAmount(event.target.value)} />
-                  <button className="primary-button full-button" type="submit">
-                    {user ? "Place demo bid →" : "Sign in to place a bid →"}
+                  <input id="bid-amount" type="number" min={selectedItem.bids.length ? leadingBid(selectedItem) + selectedItem.increment : selectedItem.price} step="0.01" required value={bidAmount} onChange={(event) => setBidAmount(event.target.value)} disabled={bidBusy} />
+                  <button className="primary-button full-button" type="submit" disabled={bidBusy}>
+                    {bidBusy
+                      ? "Placing bid..."
+                      : user
+                        ? "Place bid →"
+                        : "Sign in to place a bid →"}
                   </button>
                 </form>
               ) : (
-                <p className="form-notice">This auction is closed in the demo.</p>
+                <p className="form-notice">This auction is no longer accepting bids.</p>
               )}
-              <p className="demo-disclaimer">Demo only: bids are stored in this browser's memory. They are not shared or secure until the backend is connected.</p>
             </div>
           </section>
         </div>
@@ -755,7 +1196,11 @@ function ProductCard({ item, now, countdown, onOpen }) {
     <article className="product-card">
       <button className="product-image" style={{ backgroundColor: item.color }} onClick={onOpen} aria-label={`View ${item.title}`}>
         <span className="condition-pill">{item.condition}</span>
-        <span className="product-emoji">{item.emoji}</span>
+        {item.photoUrls[0] ? (
+          <img className="product-photo" src={item.photoUrls[0]} alt="" />
+        ) : (
+          <span className="product-emoji">{item.emoji}</span>
+        )}
       </button>
       <div className="product-info">
         <span className="product-category">{item.category}</span>
