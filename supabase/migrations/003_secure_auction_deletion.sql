@@ -23,6 +23,42 @@ REVOKE ALL ON TABLE public.auction_deletion_requests
 GRANT SELECT (auction_id)
   ON public.auction_deletion_requests TO authenticated;
 
+CREATE FUNCTION public.prevent_shared_auction_photo_paths()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_path text;
+BEGIN
+  FOREACH v_path IN ARRAY NEW.photo_paths
+  LOOP
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended(v_path, 0)
+    );
+
+    IF EXISTS (
+      SELECT 1
+      FROM public.auctions AS a
+      WHERE a.id IS DISTINCT FROM NEW.id
+        AND a.photo_paths @> ARRAY[v_path]
+    ) THEN
+      RAISE EXCEPTION 'A listing photo cannot be shared by multiple auctions.';
+    END IF;
+  END LOOP;
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.prevent_shared_auction_photo_paths()
+  FROM PUBLIC, anon, authenticated;
+
+CREATE TRIGGER auctions_prevent_shared_photo_paths
+  BEFORE INSERT OR UPDATE OF photo_paths
+  ON public.auctions
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_shared_auction_photo_paths();
+
 CREATE FUNCTION public.begin_auction_deletion(p_auction_id uuid)
 RETURNS text[]
 LANGUAGE plpgsql
@@ -83,6 +119,19 @@ BEGIN
       OR v_path !~ ('^' || v_seller_id::text || '/[^/]+/[^/]+$')
     THEN
       RAISE EXCEPTION 'A listing photo is outside your storage folder.';
+    END IF;
+
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended(v_path, 0)
+    );
+
+    IF EXISTS (
+      SELECT 1
+      FROM public.auctions AS a
+      WHERE a.id <> p_auction_id
+        AND a.photo_paths @> ARRAY[v_path]
+    ) THEN
+      RAISE EXCEPTION 'A listing photo is also used by another auction.';
     END IF;
   END LOOP;
 

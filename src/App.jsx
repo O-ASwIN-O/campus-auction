@@ -24,6 +24,20 @@ const categoryEmoji = {
   Electronics: "🎧",
 };
 
+function EyeIcon({ visible }) {
+  return visible ? (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 3l18 18M10.6 10.6a2 2 0 0 0 2.8 2.8" />
+      <path d="M9.9 5.2A10.8 10.8 0 0 1 12 5c5.5 0 9 7 9 7a15.7 15.7 0 0 1-3.1 3.8M6.2 6.2C3.9 7.7 3 12 3 12s3.5 7 9 7a10.5 10.5 0 0 0 3-.4" />
+    </svg>
+  ) : (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 12s3.5-7 9-7 9 7 9 7-3.5 7-9 7-9-7-9-7Z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
 function money(amount) {
   return `₹${Number(amount).toLocaleString("en-IN")}`;
 }
@@ -151,6 +165,7 @@ function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
   const [authMode, setAuthMode] = useState("signin");
+  const [authError, setAuthError] = useState("");
   const [itemsLoading, setItemsLoading] = useState(true);
   const [itemsError, setItemsError] = useState("");
   const [authIntent, setAuthIntent] = useState("buy");
@@ -170,6 +185,10 @@ function App() {
   const [loginName, setLoginName] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [deletingAuctionId, setDeletingAuctionId] = useState(null);
+  const [deletionPendingIds, setDeletionPendingIds] = useState(() => new Set());
+  const currentUserId = user?.id;
   const photoPreviews = useMemo(
     () => photoFiles.map((file) => URL.createObjectURL(file)),
     [photoFiles],
@@ -245,6 +264,37 @@ function App() {
   );
 
   useEffect(() => {
+    let active = true;
+
+    if (!currentUserId) return undefined;
+
+    supabase
+      .from("auction_deletion_requests")
+      .select("auction_id")
+      .then(({ data, error }) => {
+        if (!active) return;
+        if (error) {
+          console.error("Could not load pending listing deletions.", error);
+          flash("Pending listing deletions could not be loaded.");
+          return;
+        }
+
+        setDeletionPendingIds(
+          new Set((data || []).map((row) => row.auction_id)),
+        );
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error("Could not request pending listing deletions.", error);
+        flash("Pending listing deletions could not be loaded.");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [currentUserId]);
+
+  useEffect(() => {
     const auctionId = selectedItem?.id;
     if (!auctionId) return undefined;
     let active = true;
@@ -305,10 +355,11 @@ function App() {
 
   async function handleAuth(event) {
     event.preventDefault();
+    setAuthError("");
 
     const email = loginEmail.trim();
     if (!email || !loginPassword) {
-      flash("Enter your email and password.");
+      setAuthError("Enter your email and password.");
       return;
     }
 
@@ -339,15 +390,16 @@ function App() {
       }
 
       setLoginPassword("");
+      setAuthError("");
       go(authIntent === "sell" ? "sell" : "browse");
       flash(authMode === "signup" ? "Your account is ready." : "You are signed in.");
     } catch (error) {
-      console.error("Supabase authentication failed.", error);
-      flash(
-        authMode === "signup"
-          ? "Account creation failed. Check your details and try again."
-          : "Sign-in failed. Check your email and password.",
-      );
+      const message =
+        typeof error?.message === "string" && error.message.trim()
+          ? error.message
+          : "Supabase returned an authentication error without a message.";
+      const code = typeof error?.code === "string" ? ` (${error.code})` : "";
+      setAuthError(`${message}${code}`);
     } finally {
       setAuthBusy(false);
     }
@@ -639,6 +691,105 @@ function App() {
     flash("Your listing has been cancelled.");
   }
 
+  async function deleteListing(item) {
+    if (deletingAuctionId) return;
+
+    const confirmed = window.confirm(
+      `Delete "${item.title}"? This permanently removes the listing and its photos.`,
+    );
+    if (!confirmed) return;
+
+    setDeletingAuctionId(item.id);
+    let deletionStarted = false;
+    try {
+      const { data: photoPaths, error: beginError } = await supabase.rpc(
+        "begin_auction_deletion",
+        { p_auction_id: item.id },
+      );
+      if (beginError) throw beginError;
+      deletionStarted = true;
+
+      const paths = photoPaths || [];
+      const filesByFolder = new Map();
+      for (const path of paths) {
+        const separator = path.lastIndexOf("/");
+        if (separator <= 0 || separator === path.length - 1) {
+          throw new Error("A listing photo path is invalid.");
+        }
+        const folder = path.slice(0, separator);
+        const fileName = path.slice(separator + 1);
+        const names = filesByFolder.get(folder) || [];
+        names.push({ path, fileName });
+        filesByFolder.set(folder, names);
+      }
+
+      const existingPaths = [];
+      for (const [folder, files] of filesByFolder) {
+        const { data, error } = await supabase.storage
+          .from(photoBucket)
+          .list(folder);
+        if (error) throw error;
+
+        const existingNames = new Set((data || []).map((file) => file.name));
+        existingPaths.push(
+          ...files
+            .filter((file) => existingNames.has(file.fileName))
+            .map((file) => file.path),
+        );
+      }
+
+      if (existingPaths.length) {
+        const { error } = await supabase.storage
+          .from(photoBucket)
+          .remove(existingPaths);
+        if (error) throw error;
+      }
+
+      const { error: finalizeError } = await supabase.rpc(
+        "finalize_auction_deletion",
+        { p_auction_id: item.id },
+      );
+      if (finalizeError) throw finalizeError;
+
+      setItems((previous) => previous.filter((entry) => entry.id !== item.id));
+      setDeletionPendingIds((previous) => {
+        const next = new Set(previous);
+        next.delete(item.id);
+        return next;
+      });
+      setSelectedItem(null);
+      flash("Listing and its photos were deleted.");
+
+      try {
+        setItems(await fetchListings());
+      } catch (refreshError) {
+        console.error("Listing deleted, but refreshing auctions failed.", refreshError);
+        flash("Listing deleted, but the latest auctions could not be refreshed.");
+      }
+    } catch (error) {
+      console.error("Could not delete Supabase auction.", error);
+      const errorMessage =
+        typeof error?.message === "string" ? ` ${error.message}` : "";
+      if (deletionStarted) {
+        setDeletionPendingIds((previous) => new Set(previous).add(item.id));
+        setSelectedItem((previous) =>
+          previous?.id === item.id
+            ? { ...previous, status: "CANCELLED" }
+            : previous,
+        );
+        flash(
+          `The listing is hidden from bidding, but photo cleanup did not finish. Retry deletion from its details.${errorMessage}`,
+        );
+      } else {
+        flash(
+          `The secure deletion request was rejected.${errorMessage || " Check that migration 003 is applied and that the listing is still eligible."}`,
+        );
+      }
+    } finally {
+      setDeletingAuctionId(null);
+    }
+  }
+
   const visibleItems = items.filter((item) => {
     if (item.status !== "PUBLISHED" || now >= item.endsAt) return false;
 
@@ -667,6 +818,22 @@ function App() {
       matchesClosing
     );
   });
+
+  const isSelectedAuctionOwner = Boolean(
+    user &&
+      selectedItem &&
+      String(user.id).toLowerCase() ===
+        String(selectedItem.sellerId).toLowerCase(),
+  );
+  const selectedDeletionPending = selectedItem
+    ? deletionPendingIds.has(selectedItem.id)
+    : false;
+  const selectedAuctionEligibleForDeletion = Boolean(
+    selectedItem &&
+      selectedItem.status === "PUBLISHED" &&
+      now < selectedItem.endsAt &&
+      selectedItem.bids.length === 0,
+  );
 
   function countdown(endTime) {
     const remaining = Math.max(0, endTime - now);
@@ -908,7 +1075,10 @@ function App() {
                   <input
                     maxLength="80"
                     value={loginName}
-                    onChange={(event) => setLoginName(event.target.value)}
+                      onChange={(event) => {
+                        setLoginName(event.target.value);
+                        setAuthError("");
+                      }}
                     placeholder="Your name"
                   />
                 </label>
@@ -920,22 +1090,44 @@ function App() {
                   autoComplete="email"
                   required
                   value={loginEmail}
-                  onChange={(event) => setLoginEmail(event.target.value)}
+                  onChange={(event) => {
+                    setLoginEmail(event.target.value);
+                    setAuthError("");
+                  }}
                   placeholder="you@college.edu"
                 />
               </label>
               <label>
                 Password
-                <input
-                  type="password"
-                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
-                  required
-                  minLength="6"
-                  value={loginPassword}
-                  onChange={(event) => setLoginPassword(event.target.value)}
-                  placeholder="Enter password"
-                />
+                <span className="password-input-wrap">
+                  <input
+                    type={passwordVisible ? "text" : "password"}
+                    autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+                    required
+                    minLength="6"
+                    value={loginPassword}
+                    onChange={(event) => {
+                      setLoginPassword(event.target.value);
+                      setAuthError("");
+                    }}
+                    placeholder="Enter password"
+                  />
+                  <button
+                    className="password-visibility-toggle"
+                    type="button"
+                    aria-label={passwordVisible ? "Hide password" : "Show password"}
+                    aria-pressed={passwordVisible}
+                    onClick={() => setPasswordVisible((visible) => !visible)}
+                  >
+                    <EyeIcon visible={passwordVisible} />
+                  </button>
+                </span>
               </label>
+              {authError && (
+                <p className="auth-error" role="alert">
+                  Supabase authentication error: {authError}
+                </p>
+              )}
               <button className="primary-button full-button" type="submit" disabled={authBusy}>
                 {authBusy
                   ? "Please wait..."
@@ -948,7 +1140,10 @@ function App() {
                 <button
                   className="text-button"
                   type="button"
-                  onClick={() => setAuthMode(authMode === "signup" ? "signin" : "signup")}
+                  onClick={() => {
+                    setAuthMode(authMode === "signup" ? "signin" : "signup");
+                    setAuthError("");
+                  }}
                 >
                   {authMode === "signup" ? "Sign in" : "Create an account"}
                 </button>
@@ -1179,6 +1374,50 @@ function App() {
                 </form>
               ) : (
                 <p className="form-notice">This auction is no longer accepting bids.</p>
+              )}
+              {isSelectedAuctionOwner && (
+                <div className="seller-delete-section">
+                  {selectedDeletionPending ? (
+                    <>
+                      <p className="form-notice">
+                        Photo cleanup is pending. You can retry deleting this listing.
+                      </p>
+                      <button
+                        className="delete-listing-button"
+                        type="button"
+                        disabled={deletingAuctionId === selectedItem.id}
+                        onClick={() => deleteListing(selectedItem)}
+                      >
+                        {deletingAuctionId === selectedItem.id
+                          ? "Finishing deletion..."
+                          : "Retry delete listing"}
+                      </button>
+                    </>
+                  ) : detailLoading ? (
+                    <button className="delete-listing-button" type="button" disabled>
+                      Checking listing eligibility...
+                    </button>
+                  ) : selectedAuctionEligibleForDeletion ? (
+                    <button
+                      className="delete-listing-button"
+                      type="button"
+                      disabled={deletingAuctionId === selectedItem.id}
+                      onClick={() => deleteListing(selectedItem)}
+                    >
+                      {deletingAuctionId === selectedItem.id
+                        ? "Deleting listing..."
+                        : "Delete listing"}
+                    </button>
+                  ) : (
+                    <p className="form-notice">
+                      This listing cannot be deleted{selectedItem.bids.length > 0
+                        ? " because it has bids"
+                        : selectedItem.status !== "PUBLISHED"
+                          ? ` because its status is ${selectedItem.status.toLowerCase()}`
+                          : " because it has expired"}. Continue with the normal auction process.
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           </section>
