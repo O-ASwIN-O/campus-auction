@@ -1,6 +1,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase.js";
+import AuctionAssistant from "./AuctionAssistant.jsx";
 import "./App.css";
 
 const categories = ["All", "Cycle", "Calculator", "Books", "Electronics"];
@@ -1081,7 +1082,7 @@ function App() {
     const listingMode =
       nextPage === "my-listings"
         ? "seller"
-        : ["home", "browse"].includes(nextPage)
+        : ["home", "browse", "assistant"].includes(nextPage)
           ? "active"
           : null;
     if (listingMode) {
@@ -1423,7 +1424,7 @@ function App() {
         return;
       }
 
-      const onBuyerScreen = ["home", "browse"].includes(page);
+      const onBuyerScreen = ["home", "browse", "assistant"].includes(page);
       if (
         onBuyerScreen &&
         !allowClosed &&
@@ -2299,6 +2300,9 @@ function App() {
 
         <nav className="nav-links">
           <NavButton onClick={() => go("browse")}>Buy items</NavButton>
+          <NavButton onClick={() => go("assistant")}>
+            Auction assistant
+          </NavButton>
           <NavButton onClick={() => user ? go("sell") : requestLogin("sell")}>
             Sell items
           </NavButton>
@@ -2812,6 +2816,29 @@ function App() {
               </div>
             )}
           </section>
+        )}
+
+        {page === "assistant" && (
+          <AuctionAssistant
+            categories={categories}
+            currentUserId={currentUserId}
+            fetchListings={fetchListings}
+            money={money}
+            onOpenItem={openItem}
+            renderAuctionCard={(item, onOpen) => (
+              <ProductCard
+                item={item}
+                now={now}
+                countdown={countdown}
+                onOpen={onOpen}
+              />
+            )}
+            savedSearches={userSavedSearches}
+            savedSearchesError={userSavedSearchesError}
+            savedSearchesLoading={savedSearchesLoading}
+            savedSearchesOwnerId={savedSearchesOwnerId}
+            user={user}
+          />
         )}
 
         {page === "login" && (
