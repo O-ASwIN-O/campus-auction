@@ -11,6 +11,7 @@ const allowedPhotoTypes = new Map([
   ["image/webp", "webp"],
 ]);
 const maxPhotoSize = 5 * 1024 * 1024;
+const maxAuctionDurationMinutes = 30 * 24 * 60;
 const categoryColors = {
   Cycle: "#e2f3e6",
   Calculator: "#e8ebff",
@@ -195,6 +196,42 @@ async function fetchListings() {
   );
 }
 
+async function fetchListingById(auctionId) {
+  const { data: auction, error: auctionError } = await supabase
+    .from("auctions")
+    .select(
+      "id, seller_id, title, description, category, item_condition, starting_price, min_increment, closes_at, photo_paths, status",
+    )
+    .eq("id", auctionId)
+    .maybeSingle();
+
+  if (auctionError) throw auctionError;
+  if (!auction) return null;
+
+  const [bidsResult, profileResult, photoUrlsByPath] = await Promise.all([
+    supabase
+      .from("public_bid_history")
+      .select("bid_id, auction_id, amount, created_at, auction_status")
+      .eq("auction_id", auctionId)
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("profiles")
+      .select("display_name")
+      .eq("id", auction.seller_id)
+      .maybeSingle(),
+    createPhotoUrlMap(auction.photo_paths || []),
+  ]);
+
+  if (bidsResult.error) throw bidsResult.error;
+  if (profileResult.error) throw profileResult.error;
+
+  return mapAuction(
+    { ...auction, seller_name: profileResult.data?.display_name },
+    (bidsResult.data || []).map(mapBid),
+    photoUrlsByPath,
+  );
+}
+
 function NavButton({ children, onClick, className = "", disabled = false }) {
   return (
     <button className={className} onClick={onClick} disabled={disabled}>
@@ -273,7 +310,8 @@ function App() {
     description: "",
     price: "",
     increment: "50",
-    hours: "24",
+    durationMinutes: "1440",
+    customDurationMinutes: "",
   });
 
   const [now, setNow] = useState(Date.now());
@@ -359,6 +397,43 @@ function App() {
   );
 
   useEffect(() => {
+    if (!items.length) return undefined;
+    let active = true;
+    const auctionIds = items.map((item) => item.id);
+
+    const interval = setInterval(async () => {
+      const { data, error } = await supabase
+        .from("auctions")
+        .select("id")
+        .in("id", auctionIds);
+
+      if (!active) return;
+      if (error) {
+        console.error("Could not reconcile cached auction listings.", error);
+        return;
+      }
+
+      const existingIds = new Set((data || []).map((auction) => auction.id));
+      const deletedIds = new Set(
+        auctionIds.filter((auctionId) => !existingIds.has(auctionId)),
+      );
+      if (!deletedIds.size) return;
+
+      setItems((previous) =>
+        previous.filter((item) => !deletedIds.has(item.id)),
+      );
+      setSelectedItem((current) =>
+        current && deletedIds.has(current.id) ? null : current,
+      );
+    }, 15000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [items]);
+
+  useEffect(() => {
     let active = true;
 
     if (!currentUserId) return undefined;
@@ -442,56 +517,37 @@ function App() {
     };
   }, [currentUserId]);
 
-  useEffect(() => {
-    const auctionId = selectedItem?.id;
-    if (!auctionId) return undefined;
-    let active = true;
-
-    supabase
-      .from("public_bid_history")
-      .select("bid_id, auction_id, amount, created_at, auction_status")
-      .eq("auction_id", auctionId)
-      .order("created_at", { ascending: false })
-      .then(({ data, error }) => {
-        if (!active) return;
-        if (error) {
-          console.error("Could not load public bid history.", error);
-          flash("Bid history could not be loaded.");
-          return;
-        }
-        const bids = (data || []).map(mapBid);
-        setItems((previous) =>
-          previous.map((item) =>
-            item.id === auctionId ? { ...item, bids } : item,
-          ),
-        );
-        setSelectedItem((current) =>
-          current?.id === auctionId ? { ...current, bids } : current,
-        );
-      })
-      .catch((error) => {
-        if (!active) return;
-        console.error("Could not request public bid history.", error);
-        flash("Bid history could not be loaded.");
-      })
-      .finally(() => {
-        if (active) setDetailLoading(false);
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [selectedItem?.id]);
-
   function flash(message) {
     setNotice(message);
     setTimeout(() => setNotice(""), 3500);
+  }
+
+  async function refreshListings() {
+    setItemsLoading(true);
+    setItemsError("");
+    try {
+      const listings = await fetchListings();
+      setItems(listings);
+      setSelectedItem((current) =>
+        current && !listings.some((item) => item.id === current.id)
+          ? null
+          : current,
+      );
+    } catch (error) {
+      console.error("Could not refresh Supabase auctions.", error);
+      setItemsError("Auctions could not be refreshed. Please try again.");
+    } finally {
+      setItemsLoading(false);
+    }
   }
 
   function go(nextPage) {
     setSelectedItem(null);
     setPage(nextPage);
     setNotice("");
+    if (["home", "browse", "my-listings"].includes(nextPage)) {
+      void refreshListings();
+    }
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -648,9 +704,32 @@ function App() {
   }
 
   async function openItem(item) {
+    setSelectedItem(null);
     setDetailLoading(true);
-    setSelectedItem(item);
-    setBidAmount(String(leadingBid(item) + item.increment));
+    try {
+      const latestItem = await fetchListingById(item.id);
+      if (!latestItem) {
+        setItems((previous) =>
+          previous.filter((entry) => entry.id !== item.id),
+        );
+        setSelectedItem((current) =>
+          current?.id === item.id ? null : current,
+        );
+        flash("This auction is no longer available.");
+        return;
+      }
+
+      setItems((previous) =>
+        previous.map((entry) => (entry.id === item.id ? latestItem : entry)),
+      );
+      setSelectedItem(latestItem);
+      setBidAmount(String(leadingBid(latestItem) + latestItem.increment));
+    } catch (error) {
+      console.error("Could not load the latest auction details.", error);
+      flash("Auction details could not be verified. Please try again.");
+    } finally {
+      setDetailLoading(false);
+    }
   }
 
   async function placeBid(event) {
@@ -893,7 +972,10 @@ function App() {
 
     const price = Number(form.price);
     const increment = Number(form.increment);
-    const hours = Number(form.hours);
+    const durationMinutes =
+      form.durationMinutes === "custom"
+        ? Number(form.customDurationMinutes)
+        : Number(form.durationMinutes);
 
     if (
       !form.title.trim() ||
@@ -902,11 +984,12 @@ function App() {
       price <= 0 ||
       !Number.isFinite(increment) ||
       increment <= 0 ||
-      !Number.isFinite(hours) ||
-      hours <= 0 ||
+      !Number.isInteger(durationMinutes) ||
+      durationMinutes < 1 ||
+      durationMinutes > maxAuctionDurationMinutes ||
       photoFiles.length > 5
     ) {
-      flash("Enter valid item details, price and closing time.");
+      flash("Enter valid item details, price, and a duration between 1 minute and 30 days.");
       return;
     }
 
@@ -940,7 +1023,9 @@ function App() {
         uploadedPaths.push(path);
       }
 
-      const closesAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+      const closesAt = new Date(
+        Date.now() + durationMinutes * 60 * 1000,
+      ).toISOString();
       const listingData = {
         title: form.title.trim(),
         description: form.description.trim(),
@@ -988,7 +1073,8 @@ function App() {
         description: "",
         price: "",
         increment: "50",
-        hours: "24",
+        durationMinutes: "1440",
+        customDurationMinutes: "",
       });
       go("browse");
       flash(
@@ -997,12 +1083,6 @@ function App() {
           : "Auction published. Photos could not be loaded; refresh and try again.",
       );
 
-      try {
-        setItems(await fetchListings());
-      } catch (refreshError) {
-        console.error("Could not refresh listings after publishing.", refreshError);
-        flash("Auction published, but the latest listings could not be refreshed.");
-      }
     } catch (error) {
       console.error("Could not publish Supabase auction.", error);
       if (!listingCreated && uploadedPaths.length) {
@@ -1176,7 +1256,14 @@ function App() {
   }
 
   const visibleItems = items.filter((item) => {
-    if (item.status !== "PUBLISHED" || now >= item.endsAt) return false;
+    if (
+      itemsLoading ||
+      itemsError ||
+      item.status !== "PUBLISHED" ||
+      now >= item.endsAt
+    ) {
+      return false;
+    }
 
     const matchesSearch =
       `${item.title} ${item.description} ${item.category}`
@@ -1203,7 +1290,14 @@ function App() {
       matchesClosing
     );
   });
-  const cancelledItems = items.filter((item) => item.status === "CANCELLED");
+  const cancelledItems =
+    itemsLoading || itemsError
+      ? []
+      : items.filter((item) => item.status === "CANCELLED");
+  const sellerItems =
+    itemsLoading || itemsError
+      ? []
+      : items.filter((item) => item.sellerId === user?.id);
 
   const isSelectedAuctionOwner = Boolean(
     user &&
@@ -1792,15 +1886,48 @@ function App() {
                 </div>
                 <label>
                   Auction duration
-                  <select value={form.hours} onChange={(event) => setForm({ ...form, hours: event.target.value })}>
-                    <option value="1">1 hour</option>
-                    <option value="6">6 hours</option>
-                    <option value="12">12 hours</option>
-                    <option value="24">24 hours</option>
-                    <option value="48">48 hours</option>
-                    <option value="72">3 days</option>
+                  <select
+                    value={form.durationMinutes}
+                    onChange={(event) =>
+                      setForm({ ...form, durationMinutes: event.target.value })
+                    }
+                  >
+                    <option value="1">1 minute</option>
+                    <option value="5">5 minutes</option>
+                    <option value="10">10 minutes</option>
+                    <option value="30">30 minutes</option>
+                    <option value="60">1 hour</option>
+                    <option value="360">6 hours</option>
+                    <option value="720">12 hours</option>
+                    <option value="1440">24 hours</option>
+                    <option value="2880">2 days</option>
+                    <option value="4320">3 days</option>
+                    <option value="custom">Custom duration</option>
                   </select>
                 </label>
+                {form.durationMinutes === "custom" && (
+                  <label>
+                    Custom duration (minutes)
+                    <input
+                      required
+                      type="number"
+                      min="1"
+                      max={maxAuctionDurationMinutes}
+                      step="1"
+                      value={form.customDurationMinutes}
+                      onChange={(event) =>
+                        setForm({
+                          ...form,
+                          customDurationMinutes: event.target.value,
+                        })
+                      }
+                      placeholder={`1-${maxAuctionDurationMinutes}`}
+                    />
+                    <span className="field-hint">
+                      Enter a whole number from 1 to 43,200 minutes (30 days).
+                    </span>
+                  </label>
+                )}
                 <label>
                   Item photos (up to 5; JPG, PNG or WebP, max 5 MB each)
                   <input
@@ -1831,7 +1958,7 @@ function App() {
                   </div>
                 )}
                 <div className="form-notice">
-                  Your auction closes after the selected duration. Photos are visible to everyone.
+                  The closing time is saved when you publish and is checked by the database when bids are placed. Photos are visible to everyone.
                 </div>
                 <button
                   className="primary-button full-button"
@@ -1856,7 +1983,7 @@ function App() {
             </div>
             <div className="product-grid">
               {itemsLoading && <p className="results-count">Loading your listings...</p>}
-              {items.filter((item) => item.sellerId === user?.id).map((item) => (
+              {sellerItems.map((item) => (
                 <div className="seller-listing" key={item.id}>
                   <ProductCard
                     item={item}
@@ -1881,7 +2008,7 @@ function App() {
                 </div>
               ))}
             </div>
-            {!itemsLoading && !itemsError && items.filter((item) => item.sellerId === user?.id).length === 0 && (
+            {!itemsLoading && !itemsError && sellerItems.length === 0 && (
               <div className="empty-state">
                 <span>📦</span>
                 <h3>No listings yet</h3>
