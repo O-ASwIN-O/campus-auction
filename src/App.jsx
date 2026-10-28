@@ -531,7 +531,7 @@ function App() {
     const interval = setInterval(async () => {
       let currentAuctionsQuery = supabase
         .from("auctions")
-        .select("id")
+        .select("id, closes_at")
         .in("id", auctionIds);
 
       if (page === "my-listings" && currentUserId) {
@@ -556,15 +556,37 @@ function App() {
       const deletedIds = new Set(
         auctionIds.filter((auctionId) => !existingIds.has(auctionId)),
       );
-      if (!deletedIds.size) return;
+      const currentEndsAt = new Map(
+        (data || []).map((auction) => [
+          auction.id,
+          new Date(auction.closes_at).getTime(),
+        ]),
+      );
 
-      setItems((previous) =>
-        previous.filter((item) => !deletedIds.has(item.id)),
-      );
+      setItems((previous) => {
+        let changed = false;
+        const next = previous
+          .filter((item) => !deletedIds.has(item.id))
+          .map((item) => {
+            const endsAt = currentEndsAt.get(item.id);
+            if (endsAt === undefined || endsAt === item.endsAt) return item;
+            changed = true;
+            return { ...item, endsAt };
+          });
+        if (next.length !== previous.length) changed = true;
+        return changed ? next : previous;
+      });
       setSelectedItem((current) =>
-        current && deletedIds.has(current.id) ? null : current,
+        current
+          ? deletedIds.has(current.id)
+            ? null
+            : currentEndsAt.has(current.id) &&
+                currentEndsAt.get(current.id) !== current.endsAt
+              ? { ...current, endsAt: currentEndsAt.get(current.id) }
+              : current
+          : null,
       );
-    }, 15000);
+    }, 5000);
 
     return () => {
       active = false;
@@ -1524,15 +1546,29 @@ function App() {
     }
 
     try {
-      const { data, error: historyError } = await supabase
-        .from("public_bid_history")
-        .select("bid_id, auction_id, amount, created_at, auction_status")
-        .eq("auction_id", item.id)
-        .order("created_at", { ascending: false });
+      const [historyResult, auctionResult] = await Promise.all([
+        supabase
+          .from("public_bid_history")
+          .select("bid_id, auction_id, amount, created_at, auction_status")
+          .eq("auction_id", item.id)
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("auctions")
+          .select("closes_at")
+          .eq("id", item.id)
+          .single(),
+      ]);
+      const { data, error: historyError } = historyResult;
+      const { data: auctionData, error: auctionError } = auctionResult;
       if (historyError) throw historyError;
+      if (auctionError) throw auctionError;
 
       const bids = (data || []).map(mapBid);
-      const updatedItem = { ...item, bids };
+      const updatedItem = {
+        ...item,
+        bids,
+        endsAt: new Date(auctionData.closes_at).getTime(),
+      };
       setItems((previous) =>
         previous.map((entry) => (entry.id === item.id ? updatedItem : entry)),
       );
