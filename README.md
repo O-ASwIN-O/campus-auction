@@ -92,6 +92,10 @@ database.
 | `009_result_contact_sharing.sql` | Notifies both parties about pending/decided results and adds restricted Auth-email lookup. | Requires the schema and result functions from migrations 001–008. |
 | `010_auction_ended_no_bids_notification_type.sql` | Adds a notification type for expired auctions with no bids. | Run and confirm separately before migration 011. |
 | `011_automated_auction_result_processing.sql` | Adds database-side expiry processing, updates result notices, backfills eligible notices, and schedules a one-minute `pg_cron` job. | Requires migrations 001–010 in order and a Supabase database where `pg_cron` is available and permitted. |
+| `012_auction_question_notification_types.sql` | Adds notification types for buyer questions and seller replies. | Run as a completed migration before migration 013. |
+| `013_auction_questions_and_answers.sql` | Adds public-safe Q&A reads, RLS, idempotent question submission, and one-time seller replies. | Requires migrations 001–012. Does not alter existing auction or notification RPCs. |
+| `014_auction_chat_notification_type.sql` | Adds the private chat-message notification type. | Run as a completed migration before migration 015. |
+| `015_auction_chat_and_expiry_cleanup.sql` | Adds private per-buyer conversations, authorization-checked chat RPCs, and scheduled expired-chat cleanup. | Requires migrations 001–014 and the `pg_cron` extension available from the migration 011 scheduler setup. |
 
 Migrations 010 and 011 are present in the repository, but their live Supabase
 application status must be confirmed in the Supabase project. After applying
@@ -140,6 +144,73 @@ verify its scheduled runs before relying on permanent cleanup.
 
 The expiry-result job in migration 011 is separate from the cancelled-auction
 cleanup job in migration 008.
+
+### Auction chat and earlier Q&A migrations
+
+The auction details modal now presents product information and a separate
+private chat panel. Each buyer has a separate conversation with the seller, so
+buyers cannot read one another's messages. Signed-in users other than the
+seller may start a conversation while an auction is `published` and before its
+database `closes_at` deadline. The seller can select among buyer conversations.
+There is no read-only chat access after the auction deadline or for other
+auction statuses.
+
+Migration 015 enforces those rules in PostgreSQL RPCs; the browser countdown is
+only a display. Direct table access is revoked and RLS is enabled. Message
+notifications identify the auction but do not include message contents or
+contact details. A separate `pg_cron` job, `campus-auction-chat-cleanup`, uses
+the extension already used by migration 011. It deletes conversations only
+when their auction's original `closes_at` has passed; messages cascade from
+those conversations. Access is denied at the deadline even if the cleanup job
+has not run yet. Physical deletion normally follows within about a minute,
+but can be delayed if the scheduler is unavailable.
+
+Migrations 012 and 013 remain in the migration history, but the current
+frontend no longer displays or calls the Q&A feature. They are not edited or
+removed because they may already be applied in a Supabase project. Apply and
+confirm migrations 012 and 013 before 014 and 015; none is applied
+automatically by the application. Before relying on chat, verify both the new
+RPCs and the cleanup job in a test Supabase project.
+
+Read-only scheduler checks after applying migration 015:
+
+```sql
+SELECT
+  to_regprocedure('public.open_auction_chat(uuid)') AS open_chat,
+  to_regprocedure('public.list_auction_chat_conversations(uuid)') AS list_chats,
+  to_regprocedure('public.read_auction_chat(uuid)') AS read_chat,
+  to_regprocedure('public.send_auction_chat_message(uuid,text,uuid)') AS send_chat,
+  to_regprocedure('public.cleanup_expired_auction_chats()') AS cleanup;
+
+SELECT jobid, jobname, schedule, command, active
+FROM cron.job
+WHERE jobname IN (
+  'campus-auction-expired-results',
+  'campus-auction-chat-cleanup'
+);
+
+SELECT jobid, runid, status, return_message, start_time, end_time
+FROM cron.job_run_details
+WHERE jobid IN (
+  SELECT jobid
+  FROM cron.job
+  WHERE jobname = 'campus-auction-chat-cleanup'
+)
+ORDER BY start_time DESC
+LIMIT 20;
+```
+
+Test in a non-production Supabase project with one seller, two buyers, and an
+unrelated signed-in account. Have both buyers open conversations for a published
+auction and confirm each buyer sees only their own thread while the seller can
+select both. Verify an unrelated account cannot read or send to any thread, a
+buyer cannot access another buyer's thread, and the seller cannot chat with
+themself. Test empty and over-500-character messages through the RPC as well as
+the UI. After setting a test auction's `closes_at` into the past, confirm reads
+and sends fail immediately;
+then verify the cleanup job deletes its conversations/messages while an active
+auction's messages remain. Do not treat successful SQL installation alone as
+proof that authorization or scheduled execution works.
 
 ### Supabase Auth
 
@@ -221,6 +292,15 @@ unauthorized-access checks:
 - With 011 installed, wait for the cron job to process an expired auction.
   Check auction status and persistent notifications for the seller and
   provisional winner. Also test an expired auction with no bids.
+- With 014 and 015 applied, use two signed-in buyer accounts and the seller to
+  verify separate conversations, message notifications, and message
+  authorization. Confirm the seller cannot chat with themself, an unrelated
+  account cannot read or send messages, and empty or over-500-character
+  messages are rejected by both UI and RPC.
+- Verify chat reads and sends fail immediately at the original `closes_at`,
+  including before the scheduled cleanup has run. After the cleanup job runs,
+  confirm expired conversation/message rows are deleted and active-auction
+  messages remain.
 - Approve and reject results. Confirm contact email is unavailable before
   approval and only available to the seller and confirmed winning bidder after
   approval.

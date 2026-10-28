@@ -325,6 +325,17 @@ function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationActionBusy, setNotificationActionBusy] = useState(false);
   const [notificationRefresh, setNotificationRefresh] = useState(0);
+  const [chatConversations, setChatConversations] = useState([]);
+  const [chatConversationsLoading, setChatConversationsLoading] = useState(false);
+  const [chatConversationId, setChatConversationId] = useState(null);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatMessagesLoading, setChatMessagesLoading] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatRequestKey, setChatRequestKey] = useState(null);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatFeedback, setChatFeedback] = useState(null);
+  const [chatRefresh, setChatRefresh] = useState(0);
 
   const [loginName, setLoginName] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
@@ -567,6 +578,161 @@ function App() {
   }, [currentUserId, notificationRefresh]);
 
   useEffect(() => {
+    let active = true;
+    const auctionId = selectedItem?.id;
+    const auctionSellerId = selectedItem?.sellerId;
+    const auctionStatus = selectedItem?.status;
+    const auctionEndsAt = selectedItem?.endsAt;
+
+    if (!auctionId || !currentUserId) return undefined;
+
+    if (
+      auctionStatus !== "PUBLISHED" ||
+      Date.now() >= auctionEndsAt
+    ) {
+      return undefined;
+    }
+
+    async function loadSellerConversations() {
+      setChatConversationsLoading(true);
+      try {
+        const { data, error } = await supabase.rpc(
+          "list_auction_chat_conversations",
+          { p_auction_id: auctionId },
+        );
+        if (error) throw error;
+        if (!active) return;
+
+        const conversations = data || [];
+        setChatConversations(conversations);
+        setChatConversationId((current) =>
+          conversations.some((entry) => entry.conversation_id === current)
+            ? current
+            : conversations[0]?.conversation_id || null,
+        );
+        setChatError("");
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not load auction chat conversations.", error);
+        setChatError(
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Conversations could not be loaded. Please try again.",
+        );
+      } finally {
+        if (active) setChatConversationsLoading(false);
+      }
+    }
+
+    async function openBuyerConversation() {
+      setChatConversationsLoading(true);
+      try {
+        const { data, error } = await supabase.rpc("open_auction_chat", {
+          p_auction_id: auctionId,
+        });
+        if (error) throw error;
+        if (!active) return;
+
+        const conversationId = data?.[0]?.conversation_id;
+        if (!conversationId) {
+          throw new Error("The conversation could not be opened.");
+        }
+        setChatConversationId(conversationId);
+        setChatError("");
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not open the auction chat.", error);
+        setChatError(
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Chat could not be opened. Please try again.",
+        );
+      } finally {
+        if (active) setChatConversationsLoading(false);
+      }
+    }
+
+    const loadConversation = auctionSellerId === currentUserId
+      ? loadSellerConversations
+      : openBuyerConversation;
+
+    void loadConversation();
+    const interval = setInterval(() => {
+      if (Date.now() >= auctionEndsAt) {
+        clearInterval(interval);
+        return;
+      }
+      void loadConversation();
+    }, 20000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [
+    selectedItem?.id,
+    selectedItem?.sellerId,
+    selectedItem?.status,
+    selectedItem?.endsAt,
+    currentUserId,
+  ]);
+
+  useEffect(() => {
+    let active = true;
+    let firstLoad = true;
+    const auctionId = selectedItem?.id;
+    const auctionEndsAt = selectedItem?.endsAt;
+    const conversationId = chatConversationId;
+
+    if (!auctionId || !conversationId || !currentUserId) return undefined;
+
+    async function loadMessages() {
+      try {
+        if (firstLoad) setChatMessagesLoading(true);
+        const { data, error } = await supabase.rpc("read_auction_chat", {
+          p_conversation_id: conversationId,
+        });
+        if (error) throw error;
+        if (active) {
+          setChatMessages(data || []);
+          setChatError("");
+        }
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not load auction chat messages.", error);
+        setChatError(
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Messages could not be loaded. Please try again.",
+        );
+      } finally {
+        firstLoad = false;
+        if (active) setChatMessagesLoading(false);
+      }
+    }
+
+    void loadMessages();
+    const interval = setInterval(() => {
+      if (Date.now() >= auctionEndsAt) {
+        clearInterval(interval);
+        return;
+      }
+      void loadMessages();
+    }, 12000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [
+    selectedItem?.id,
+    selectedItem?.endsAt,
+    chatConversationId,
+    currentUserId,
+    chatRefresh,
+  ]);
+
+  useEffect(() => {
     function handleNotificationDismiss(event) {
       if (!notificationControlRef.current?.contains(event.target)) {
         setNotificationsOpen(false);
@@ -636,6 +802,58 @@ function App() {
       flash("Notifications could not be marked as read.");
     } finally {
       setNotificationActionBusy(false);
+    }
+  }
+
+  async function sendAuctionChatMessage(event) {
+    event.preventDefault();
+    if (chatSending || !chatConversationId || !selectedItem) return;
+
+    const message = chatDraft.trim();
+    if (!message || message.length > 500) {
+      setChatFeedback({
+        kind: "error",
+        message: "Enter a message using 1 to 500 characters.",
+      });
+      return;
+    }
+
+    if (!user) {
+      setChatFeedback({
+        kind: "error",
+        message: "Sign in before sending a message.",
+      });
+      return;
+    }
+
+    const requestKey = chatRequestKey || crypto.randomUUID();
+    setChatRequestKey(requestKey);
+    setChatSending(true);
+    setChatFeedback(null);
+    try {
+      const { error } = await supabase.rpc("send_auction_chat_message", {
+        p_conversation_id: chatConversationId,
+        p_message: message,
+        p_idempotency_key: requestKey,
+      });
+      if (error) throw error;
+
+      setChatDraft("");
+      setChatRequestKey(null);
+      setChatFeedback({ kind: "success", message: "Message sent." });
+      setChatRefresh((count) => count + 1);
+      setNotificationRefresh((count) => count + 1);
+    } catch (error) {
+      console.error("Could not send an auction chat message.", error);
+      setChatFeedback({
+        kind: "error",
+        message:
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "Your message could not be sent. Please try again.",
+      });
+    } finally {
+      setChatSending(false);
     }
   }
 
@@ -837,6 +1055,15 @@ function App() {
   async function openItem(item, { allowClosed = false } = {}) {
     const contactRequest = ++contactRequestId.current;
     setSelectedItem(null);
+    setChatConversations([]);
+    setChatConversationId(null);
+    setChatMessages([]);
+    setChatConversationsLoading(false);
+    setChatMessagesLoading(false);
+    setChatError("");
+    setChatDraft("");
+    setChatRequestKey(null);
+    setChatFeedback(null);
     setAuctionContact(null);
     setAuctionContactError("");
     setAuctionContactLoading(false);
@@ -1568,6 +1795,11 @@ function App() {
       String(user.id).toLowerCase() ===
         String(selectedItem.sellerId).toLowerCase(),
   );
+  const isSelectedChatAvailable = Boolean(
+    selectedItem &&
+      selectedItem.status === "PUBLISHED" &&
+      now < selectedItem.endsAt,
+  );
   const selectedDeletionPending = selectedItem
     ? deletionPendingIds.has(selectedItem.id)
     : false;
@@ -1695,7 +1927,9 @@ function App() {
                                   ? "View provisional result"
                                   : notification.notification_type === "result_approved"
                                     ? "View result and contacts"
-                                    : "View auction"}
+                                    : notification.notification_type === "auction_chat_message"
+                                      ? "Open chat"
+                                      : "View auction"}
                               </button>
                             )}
                             {!notification.is_read && (
@@ -2400,14 +2634,15 @@ function App() {
         <div className="modal-backdrop" onClick={() => setSelectedItem(null)}>
           <section className="detail-modal" onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" aria-label="Close" onClick={() => setSelectedItem(null)}>×</button>
-            <div className="detail-art" style={{ backgroundColor: selectedItem.color }}>
-              {selectedItem.photoUrls.length ? (
-                <img src={selectedItem.photoUrls[0]} alt={selectedItem.title} />
-              ) : (
-                <span>{selectedItem.emoji}</span>
-              )}
-            </div>
-            <div className="detail-content">
+            <div className="detail-product">
+              <div className="detail-art" style={{ backgroundColor: selectedItem.color }}>
+                {selectedItem.photoUrls.length ? (
+                  <img src={selectedItem.photoUrls[0]} alt={selectedItem.title} />
+                ) : (
+                  <span>{selectedItem.emoji}</span>
+                )}
+              </div>
+              <div className="detail-content">
               <span className="eyebrow">{selectedItem.category} · {selectedItem.condition}</span>
               <h2>{selectedItem.title}</h2>
               <p>{selectedItem.description}</p>
@@ -2697,7 +2932,164 @@ function App() {
                   )}
                 </div>
               )}
+              </div>
             </div>
+            <aside className="auction-chat" aria-labelledby="auction-chat-heading">
+              <header className="auction-chat-header">
+                <span className="eyebrow">Private auction chat</span>
+                <h3 id="auction-chat-heading">{selectedItem.title}</h3>
+                <p>
+                  Only you and the listing seller can read this conversation.
+                  Chat closes when the auction ends.
+                </p>
+              </header>
+
+              {isSelectedChatAvailable ? (
+                <>
+                  {!user ? (
+                    <div className="auction-chat-empty">
+                      <p>Sign in to message the seller about this item.</p>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => {
+                          setSelectedItem(null);
+                          requestLogin("buy");
+                        }}
+                      >
+                        Sign in
+                      </button>
+                    </div>
+                  ) : isSelectedAuctionOwner ? (
+                    chatConversationsLoading && !chatConversations.length ? (
+                      <p className="muted" role="status">Loading conversations...</p>
+                    ) : chatConversations.length ? (
+                      <label className="auction-chat-conversation-picker">
+                        Buyer conversation
+                        <select
+                          value={chatConversationId || ""}
+                          onChange={(event) => {
+                            setChatConversationId(event.target.value || null);
+                            setChatMessages([]);
+                            setChatDraft("");
+                            setChatRequestKey(null);
+                            setChatFeedback(null);
+                            setChatError("");
+                          }}
+                        >
+                          {chatConversations.map((conversation) => (
+                            <option
+                              key={conversation.conversation_id}
+                              value={conversation.conversation_id}
+                            >
+                              {conversation.buyer_display_name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : (
+                      <p className="auction-chat-empty">
+                        {chatError || "No conversations yet. Buyers can message while this auction is open."}
+                      </p>
+                    )
+                  ) : chatConversationsLoading ? (
+                    <p className="muted" role="status">Opening your conversation...</p>
+                  ) : chatError ? (
+                    <p className="form-notice" role="alert">{chatError}</p>
+                  ) : null}
+
+                  {user && chatConversationId && (
+                    <>
+                      {chatError && (
+                        <p className="form-notice" role="alert">{chatError}</p>
+                      )}
+                      <div className="auction-chat-history" role="log" aria-live="polite">
+                        {chatMessagesLoading ? (
+                          <p className="muted" role="status">Loading messages...</p>
+                        ) : chatMessages.length === 0 ? (
+                          <p className="auction-chat-empty">
+                            No messages yet. Start the conversation about this item.
+                          </p>
+                        ) : (
+                          chatMessages.map((message) => (
+                            <article
+                              className={`auction-chat-message${message.is_mine ? " is-mine" : ""}`}
+                              key={message.message_id}
+                            >
+                              <span>
+                                {message.is_mine
+                                  ? "You"
+                                  : isSelectedAuctionOwner
+                                    ? chatConversations.find(
+                                        (entry) =>
+                                          entry.conversation_id === chatConversationId,
+                                      )?.buyer_display_name || "Buyer"
+                                    : "Seller"}
+                              </span>
+                              <p>{message.message_text}</p>
+                              <time dateTime={message.created_at}>
+                                {new Date(message.created_at).toLocaleString()}
+                              </time>
+                            </article>
+                          ))
+                        )}
+                      </div>
+
+                      {chatFeedback && (
+                        <p
+                          className={
+                            chatFeedback.kind === "error"
+                              ? "form-notice"
+                              : "auction-chat-success"
+                          }
+                          role={chatFeedback.kind === "error" ? "alert" : "status"}
+                        >
+                          {chatFeedback.message}
+                        </p>
+                      )}
+
+                      <form
+                        className="auction-chat-form"
+                        onSubmit={sendAuctionChatMessage}
+                      >
+                        <label htmlFor="auction-chat-input">Message</label>
+                        <textarea
+                          id="auction-chat-input"
+                          maxLength={500}
+                          rows={3}
+                          required
+                          value={chatDraft}
+                          onChange={(event) => {
+                            setChatDraft(event.target.value);
+                            setChatRequestKey(null);
+                          }}
+                          disabled={chatSending}
+                          placeholder="Write a message (up to 500 characters)"
+                        />
+                        <div className="auction-chat-form-footer">
+                          <span>{chatDraft.length}/500</span>
+                          <button
+                            className="primary-button"
+                            type="submit"
+                            disabled={
+                              chatSending ||
+                              !chatConversationId ||
+                              !chatDraft.trim()
+                            }
+                          >
+                            {chatSending ? "Sending..." : "Send"}
+                          </button>
+                        </div>
+                      </form>
+                    </>
+                  )}
+                </>
+              ) : (
+                <p className="auction-chat-empty" role="status">
+                  Chat is unavailable because this auction is no longer open.
+                </p>
+              )}
+            </aside>
           </section>
         </div>
       )}

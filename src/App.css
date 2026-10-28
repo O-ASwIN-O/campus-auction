@@ -1471,16 +1471,22 @@
 .detail-modal {
   position: relative;
   width: 100%;
-  max-width: 880px;
+  max-width: 1280px;
   max-height: 90vh;
   display: grid;
-  grid-template-columns: 0.85fr 1.15fr;
+  grid-template-columns: minmax(0, 1.65fr) minmax(300px, 0.9fr);
   overflow-y: auto;
   border-radius: var(--r-2xl);
   background: rgba(255, 255, 255, 0.97);
   box-shadow: var(--shadow-2xl), 0 0 0 1px rgba(60, 130, 90, 0.10);
   animation: modal-in var(--t-slow) var(--ease-spring) forwards;
   border: 1px solid rgba(255, 255, 255, 0.9);
+}
+
+.detail-product {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(190px, 0.7fr) minmax(0, 1.3fr);
 }
 
 @keyframes modal-in {
@@ -1664,6 +1670,147 @@
   font-weight: 700;
 }
 
+.auction-chat {
+  min-width: 0;
+  min-height: 580px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 28px 22px 22px;
+  border-left: 1px solid var(--border);
+  background: rgba(247, 251, 248, 0.82);
+}
+
+.auction-chat-header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.auction-chat-header h3 {
+  margin: 8px 0 6px;
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.auction-chat-header p,
+.auction-chat-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.auction-chat-conversation-picker,
+.auction-chat-form {
+  display: grid;
+  gap: 8px;
+}
+
+.auction-chat-conversation-picker,
+.auction-chat-form label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.auction-chat-conversation-picker select,
+.auction-chat-form textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.auction-chat-form textarea {
+  min-height: 82px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.auction-chat-form textarea:focus,
+.auction-chat-conversation-picker select:focus {
+  outline: 2px solid rgba(59, 150, 99, 0.22);
+  border-color: var(--green-400);
+}
+
+.auction-chat-history {
+  min-height: 180px;
+  max-height: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.78);
+  scrollbar-width: thin;
+  scrollbar-color: var(--green-200) transparent;
+}
+
+.auction-chat-message {
+  align-self: flex-start;
+  width: min(90%, 380px);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px 12px 12px 3px;
+  background: white;
+  overflow-wrap: anywhere;
+}
+
+.auction-chat-message.is-mine {
+  align-self: flex-end;
+  border-color: rgba(59, 150, 99, 0.22);
+  border-radius: 12px 12px 3px 12px;
+  background: var(--green-50);
+}
+
+.auction-chat-message > span {
+  color: var(--green-700);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.auction-chat-message p {
+  margin: 5px 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.auction-chat-message time {
+  display: block;
+  color: var(--muted-2);
+  font-size: 10px;
+  text-align: right;
+}
+
+.auction-chat-form-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auction-chat-form-footer > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.auction-chat-success {
+  margin: 0;
+  color: var(--green-700);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
 /* Bid form in modal */
 .bid-form {
   margin-top: 20px;
@@ -1720,6 +1867,11 @@
   .detail-modal {
     grid-template-columns: 1fr;
   }
+
+  .detail-product {
+    grid-template-columns: minmax(190px, 0.7fr) minmax(0, 1.3fr);
+  }
+
   .detail-art {
     min-height: 220px;
     border-radius: var(--r-2xl) var(--r-2xl) 0 0;
@@ -1727,6 +1879,12 @@
   }
   .detail-art img {
     min-height: 220px;
+  }
+
+  .auction-chat {
+    min-height: 0;
+    border-top: 1px solid var(--border);
+    border-left: 0;
   }
 }
 
@@ -1821,11 +1979,19 @@
     border-radius: var(--r-xl);
   }
 
+  .detail-product {
+    grid-template-columns: 1fr;
+  }
+
   .detail-art span {
     font-size: 80px;
   }
 
   .detail-content {
+    padding: 22px 20px;
+  }
+
+  .auction-chat {
     padding: 22px 20px;
   }
 
