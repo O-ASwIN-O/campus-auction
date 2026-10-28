@@ -5,8 +5,7 @@
 BEGIN;
 
 ALTER TABLE public.auctions
-  ADD COLUMN cancelled_at timestamptz,
-  ADD COLUMN cleanup_attempted_at timestamptz;
+  ADD COLUMN cancelled_at timestamptz;
 
 -- Older cancelled rows have no reliable historical cancellation timestamp.
 -- Start their retention window at rollout rather than deleting them early.
@@ -16,10 +15,7 @@ WHERE status = 'cancelled'
   AND cancelled_at IS NULL;
 
 CREATE INDEX auctions_cancelled_at_cleanup_idx
-  ON public.auctions (
-    cleanup_attempted_at ASC NULLS FIRST,
-    cancelled_at ASC
-  )
+  ON public.auctions (cancelled_at)
   WHERE status = 'cancelled';
 
 CREATE FUNCTION public.set_auction_cancelled_at()
@@ -52,6 +48,65 @@ CREATE TRIGGER auctions_set_cancelled_at
   FOR EACH ROW
   EXECUTE FUNCTION public.set_auction_cancelled_at();
 
+CREATE TABLE public.cancelled_auction_cleanup_queue (
+  auction_id uuid PRIMARY KEY
+    REFERENCES public.auctions (id) ON DELETE CASCADE,
+  enqueued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  last_attempt_at timestamptz
+);
+
+ALTER TABLE public.cancelled_auction_cleanup_queue ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.cancelled_auction_cleanup_queue
+  FROM PUBLIC, anon, authenticated;
+
+CREATE INDEX cancelled_auction_cleanup_queue_attempt_idx
+  ON public.cancelled_auction_cleanup_queue (
+    last_attempt_at ASC NULLS FIRST,
+    enqueued_at ASC
+  );
+
+INSERT INTO public.cancelled_auction_cleanup_queue (auction_id)
+SELECT id
+FROM public.auctions
+WHERE status = 'cancelled';
+
+CREATE FUNCTION public.enqueue_cancelled_auction_cleanup()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.status = 'cancelled'
+    AND (
+      TG_OP = 'INSERT'
+      OR OLD.status IS DISTINCT FROM 'cancelled'
+    )
+  THEN
+    INSERT INTO public.cancelled_auction_cleanup_queue (auction_id)
+    VALUES (NEW.id)
+    ON CONFLICT (auction_id)
+    DO UPDATE SET
+      enqueued_at = clock_timestamp(),
+      last_attempt_at = NULL;
+  ELSIF NEW.status <> 'cancelled' THEN
+    DELETE FROM public.cancelled_auction_cleanup_queue
+    WHERE auction_id = NEW.id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.enqueue_cancelled_auction_cleanup()
+  FROM PUBLIC, anon, authenticated;
+
+CREATE TRIGGER auctions_enqueue_cancelled_cleanup
+  AFTER INSERT OR UPDATE OF status
+  ON public.auctions
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enqueue_cancelled_auction_cleanup();
+
 CREATE FUNCTION public.get_expired_cancelled_auctions()
 RETURNS TABLE (
   auction_id uuid,
@@ -70,9 +125,11 @@ BEGIN
   RETURN QUERY
   SELECT a.id, a.seller_id, a.photo_paths
   FROM public.auctions AS a
+  JOIN public.cancelled_auction_cleanup_queue AS q
+    ON q.auction_id = a.id
   WHERE a.status = 'cancelled'
     AND a.cancelled_at <= clock_timestamp() - interval '24 hours'
-  ORDER BY a.cleanup_attempted_at NULLS FIRST, a.cancelled_at
+  ORDER BY q.last_attempt_at NULLS FIRST, q.enqueued_at
   LIMIT 100;
 END;
 $$;
@@ -95,9 +152,11 @@ BEGIN
     RAISE EXCEPTION 'This cleanup operation is restricted to the scheduled service.';
   END IF;
 
-  UPDATE public.auctions AS a
-  SET cleanup_attempted_at = clock_timestamp()
+  UPDATE public.cancelled_auction_cleanup_queue AS q
+  SET last_attempt_at = clock_timestamp()
+  FROM public.auctions AS a
   WHERE a.id = p_auction_id
+    AND q.auction_id = a.id
     AND a.status = 'cancelled'
     AND a.cancelled_at <= clock_timestamp() - interval '24 hours';
 

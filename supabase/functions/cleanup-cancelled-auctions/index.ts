@@ -18,17 +18,25 @@ async function findExistingPhotoPaths(
   paths: string[],
 ): Promise<string[]> {
   const existingPaths: string[] = [];
+  const pathsByFolder = new Map<string, Map<string, string>>();
   for (const path of paths) {
     const separator = path.lastIndexOf("/");
     const folder = path.slice(0, separator);
     const fileName = path.slice(separator + 1);
+    const files = pathsByFolder.get(folder) || new Map<string, string>();
+    files.set(fileName, path);
+    pathsByFolder.set(folder, files);
+  }
+
+  for (const [folder, files] of pathsByFolder) {
     const { data, error } = await supabase.storage
       .from(bucket)
-      .list(folder, { limit: 100, search: fileName });
+      .list(folder, { limit: 100 });
 
     if (error) throw error;
-    if ((data || []).some((file) => file.name === fileName)) {
-      existingPaths.push(path);
+    for (const file of data || []) {
+      const path = files.get(file.name);
+      if (path) existingPaths.push(path);
     }
   }
   return existingPaths;

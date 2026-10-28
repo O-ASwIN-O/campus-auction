@@ -263,6 +263,7 @@ function NavButton({ children, onClick, className = "", disabled = false }) {
 
 function App() {
   const listingRequestId = useRef(0);
+  const contactRequestId = useRef(0);
   const notificationControlRef = useRef(null);
   const [page, setPage] = useState(() =>
     window.location.pathname.replace(/\/+$/, "") === "/reset-password"
@@ -300,6 +301,10 @@ function App() {
   const [authIntent, setAuthIntent] = useState("buy");
   const [selectedItem, setSelectedItem] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [auctionContact, setAuctionContact] = useState(null);
+  const [auctionContactLoading, setAuctionContactLoading] = useState(false);
+  const [auctionContactError, setAuctionContactError] = useState("");
+  const [resultActionBusy, setResultActionBusy] = useState(false);
   const [bidBusy, setBidBusy] = useState(false);
   const [listingBusy, setListingBusy] = useState(false);
   const [photoFiles, setPhotoFiles] = useState([]);
@@ -829,8 +834,12 @@ function App() {
     }
   }
 
-  async function openItem(item) {
+  async function openItem(item, { allowClosed = false } = {}) {
+    const contactRequest = ++contactRequestId.current;
     setSelectedItem(null);
+    setAuctionContact(null);
+    setAuctionContactError("");
+    setAuctionContactLoading(false);
     setDetailLoading(true);
     try {
       const latestItem = await fetchListingById(item.id);
@@ -848,6 +857,7 @@ function App() {
       const onBuyerScreen = ["home", "browse"].includes(page);
       if (
         onBuyerScreen &&
+        !allowClosed &&
         (latestItem.status !== "PUBLISHED" || latestItem.endsAt <= Date.now())
       ) {
         setItems((previous) =>
@@ -862,11 +872,121 @@ function App() {
       );
       setSelectedItem(latestItem);
       setBidAmount(String(minimumNextBid(latestItem)));
+
+      if (
+        user &&
+        ["APPROVED", "COMPLETED"].includes(latestItem.status)
+      ) {
+        setAuctionContactLoading(true);
+        try {
+          const { data, error } = await supabase.rpc("get_auction_contact", {
+            p_auction_id: item.id,
+          });
+          if (contactRequest !== contactRequestId.current) return;
+          if (error) throw error;
+
+          const contact = data?.[0];
+          setAuctionContact(
+            contact
+              ? {
+                  auctionId: item.id,
+                  email: contact.contact_email,
+                  displayName: contact.contact_display_name,
+                  role: contact.contact_role,
+                }
+              : null,
+          );
+          if (!contact) {
+            setAuctionContactError(
+              "Contact details are available only to the seller and approved winning bidder.",
+            );
+          }
+        } catch (error) {
+          if (contactRequest !== contactRequestId.current) return;
+          console.error("Could not retrieve approved auction contact details.", error);
+          setAuctionContactError("Contact details could not be loaded. Please try again.");
+        } finally {
+          if (contactRequest === contactRequestId.current) {
+            setAuctionContactLoading(false);
+          }
+        }
+      }
     } catch (error) {
       console.error("Could not load the latest auction details.", error);
       flash("Auction details could not be verified. Please try again.");
     } finally {
-      setDetailLoading(false);
+      if (contactRequest === contactRequestId.current) {
+        setDetailLoading(false);
+      }
+    }
+  }
+
+  async function openNotificationAuction(notification) {
+    if (!notification.auction_id) {
+      flash("This auction is no longer available.");
+      return;
+    }
+
+    await markNotificationRead(notification.id);
+    setNotificationsOpen(false);
+    await openItem(
+      { id: notification.auction_id },
+      { allowClosed: true },
+    );
+  }
+
+  async function closeAuctionForReview(item) {
+    if (resultActionBusy) return;
+
+    setResultActionBusy(true);
+    try {
+      const { error } = await supabase.rpc("close_auction_for_review", {
+        p_auction_id: item.id,
+      });
+      if (error) throw error;
+
+      setNotificationRefresh((count) => count + 1);
+      await openItem({ id: item.id }, { allowClosed: true });
+      flash("Auction result is ready for your review.");
+    } catch (error) {
+      console.error("Could not close auction for result review.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "Auction result could not be opened for review.",
+      );
+    } finally {
+      setResultActionBusy(false);
+    }
+  }
+
+  async function decideAuctionResult(item, approve) {
+    if (resultActionBusy) return;
+
+    setResultActionBusy(true);
+    try {
+      const { error } = await supabase.rpc("decide_auction_result", {
+        p_auction_id: item.id,
+        p_approve: approve,
+      });
+      if (error) throw error;
+
+      setNotificationRefresh((count) => count + 1);
+      await openItem({ id: item.id }, { allowClosed: true });
+      flash(
+        approve
+          ? "Result approved. Both parties can now view each other's contact email."
+          : "Result rejected. Contact details remain private.",
+      );
+    } catch (error) {
+      console.error("Could not save the auction result decision.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "Your result decision could not be saved.",
+      );
+    } finally {
+      setResultActionBusy(false);
     }
   }
 
@@ -1563,6 +1683,21 @@ function App() {
                             <time dateTime={notification.created_at}>
                               {new Date(notification.created_at).toLocaleString()}
                             </time>
+                            {notification.auction_id && (
+                              <button
+                                type="button"
+                                className="notification-mark-all"
+                                onClick={() =>
+                                  openNotificationAuction(notification)
+                                }
+                              >
+                                {notification.notification_type === "result_pending"
+                                  ? "View provisional result"
+                                  : notification.notification_type === "result_approved"
+                                    ? "View result and contacts"
+                                    : "View auction"}
+                              </button>
+                            )}
                             {!notification.is_read && (
                               <button
                                 type="button"
@@ -2297,7 +2432,9 @@ function App() {
                 <span>
                   Closes in: {selectedItem.status === "CANCELLED"
                     ? "Cancelled"
-                    : countdown(selectedItem.endsAt)}
+                    : selectedItem.status !== "PUBLISHED" || now >= selectedItem.endsAt
+                      ? "Ended"
+                      : countdown(selectedItem.endsAt)}
                 </span>
                 {selectedItem.status === "PUBLISHED" && now < selectedItem.endsAt && (
                   <span>
@@ -2310,6 +2447,45 @@ function App() {
                   This auction was cancelled by the seller. It is no longer
                   accepting bids; all recorded bids remain in the public history.
                 </p>
+              )}
+              {selectedItem.status === "AWAITING_SELLER_DECISION" && (
+                <p className="form-notice" role="status">
+                  Provisional highest bid: {money(leadingBid(selectedItem))}.
+                  Seller approval is pending. Contact details remain private
+                  until the result is approved.
+                </p>
+              )}
+              {selectedItem.status === "ENDED_NO_BIDS" && (
+                <p className="form-notice" role="status">
+                  This auction ended without bids. No winner was selected.
+                </p>
+              )}
+              {["APPROVED", "COMPLETED"].includes(selectedItem.status) && user && (
+                <section className="auction-contact">
+                  <h3>Handover contact</h3>
+                  {auctionContactLoading ? (
+                    <p className="muted">Checking approved contact access...</p>
+                  ) : auctionContact?.auctionId === selectedItem.id ? (
+                    <>
+                      <p>
+                        {auctionContact.displayName} ({auctionContact.role})
+                        <br />
+                        {auctionContact.email}
+                      </p>
+                      <a
+                        className="primary-button contact-email-button"
+                        href={`mailto:${auctionContact.email}?subject=${encodeURIComponent(`Campus Auction: ${selectedItem.title}`)}`}
+                      >
+                        Contact {auctionContact.role === "seller" ? "Seller" : "Buyer"} →
+                      </a>
+                    </>
+                  ) : (
+                    <p className={auctionContactError ? "form-notice" : "muted"}>
+                      {auctionContactError ||
+                        "Contact details are available to the seller and approved winning bidder."}
+                    </p>
+                  )}
+                </section>
               )}
 
               <h3>Public bid history</h3>
@@ -2439,6 +2615,18 @@ function App() {
                           ? "Cancelling auction..."
                           : "Cancel auction"}
                       </button>
+                      {now >= selectedItem.endsAt && (
+                        <button
+                          className="primary-button full-button"
+                          type="button"
+                          disabled={resultActionBusy || detailLoading}
+                          onClick={() => closeAuctionForReview(selectedItem)}
+                        >
+                          {resultActionBusy
+                            ? "Reviewing auction result..."
+                            : "Close auction and review result"}
+                        </button>
+                      )}
                       {detailLoading ? (
                         <button className="delete-listing-button" type="button" disabled>
                           Checking whether this listing can be deleted...
@@ -2462,6 +2650,37 @@ function App() {
                         </p>
                       )}
                     </>
+                  ) : selectedItem.status === "AWAITING_SELLER_DECISION" ? (
+                    <>
+                      <p className="form-notice">
+                        Review the provisional result. Approving confirms the
+                        outcome and shares contact emails with the winning buyer.
+                      </p>
+                      <button
+                        className="primary-button full-button"
+                        type="button"
+                        disabled={resultActionBusy}
+                        onClick={() =>
+                          decideAuctionResult(selectedItem, true)
+                        }
+                      >
+                        {resultActionBusy ? "Saving decision..." : "Approve result"}
+                      </button>
+                      <button
+                        className="cancel-listing-button"
+                        type="button"
+                        disabled={resultActionBusy}
+                        onClick={() =>
+                          decideAuctionResult(selectedItem, false)
+                        }
+                      >
+                        {resultActionBusy ? "Saving decision..." : "Reject result"}
+                      </button>
+                    </>
+                  ) : selectedItem.status === "ENDED_NO_BIDS" ? (
+                    <p className="form-notice">
+                      This auction ended without bids. No winner was selected.
+                    </p>
                   ) : selectedItem.status !== "CANCELLED" ? (
                     <p className="form-notice">
                       This auction is {selectedItem.status.toLowerCase()} and

@@ -1330,6 +1330,33 @@
   margin-top: 0;
 }
 
+.auction-contact {
+  margin: 18px 0;
+  padding: 16px;
+  border: 1px solid rgba(59, 150, 99, 0.18);
+  border-radius: var(--r-md);
+  background: var(--green-50);
+}
+
+.auction-contact h3 {
+  margin: 0 0 8px;
+}
+
+.auction-contact p {
+  margin: 0 0 12px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.contact-email-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
 .photo-replacement {
   margin: 0;
   padding: 16px;
