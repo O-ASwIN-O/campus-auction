@@ -14,6 +14,8 @@ PostgreSQL, Row Level Security (RLS), and private photo storage.
   duration, description, condition, category, and up to five photos.
 - Search and marketplace filters, auction countdowns, current bid information,
   and public bid history.
+- Private saved searches for keywords, category, and maximum starting price,
+  with persistent in-app alerts for newly published matching auctions.
 - Bids submitted through the `place_bid` PostgreSQL RPC. The database checks
   the bidder, seller ownership, auction status and deadline, bid amount, and
   concurrent bids.
@@ -96,12 +98,26 @@ database.
 | `013_auction_questions_and_answers.sql` | Adds public-safe Q&A reads, RLS, idempotent question submission, and one-time seller replies. | Requires migrations 001–012. Does not alter existing auction or notification RPCs. |
 | `014_auction_chat_notification_type.sql` | Adds the private chat-message notification type. | Run as a completed migration before migration 015. |
 | `015_auction_chat_and_expiry_cleanup.sql` | Adds private per-buyer conversations, authorization-checked chat RPCs, and scheduled expired-chat cleanup. | Requires migrations 001–014 and the `pg_cron` extension available from the migration 011 scheduler setup. |
+| `016_saved_search_notification_type.sql` | Adds the notification type for saved-search matches. | Run to completion before migration 017 uses the enum value. |
+| `017_saved_searches_and_matching_alerts.sql` | Adds owner-private saved searches, RLS, duplicate prevention, and a database trigger that creates persistent alerts when an eligible auction is published. | Requires migrations 001–016 in order. Does not require a separate scheduler or browser polling. |
 
 Migrations 010 and 011 are present in the repository, but their live Supabase
 application status must be confirmed in the Supabase project. After applying
 011, verify both the function and the cron job, and then verify successful job
 runs. A scheduled job is not considered operational merely because its SQL
 definition exists.
+
+Migrations 016 and 017 are local feature files and have not necessarily been
+applied to any Supabase project. Apply 016 first and confirm it completes before
+applying 017. The trigger evaluates searches in the same transaction that
+inserts or transitions an auction to `published`; notifications remain stored
+even when the recipient is offline. It ignores expired auctions, skips the
+seller, and creates one notification per matching saved search. Category is an
+exact match, keywords are case-insensitive literal phrases over title,
+description, and category, and maximum price is compared with `starting_price`.
+Saved searches that match multiple criteria require every specified criterion
+to match. Condition and closing-time browse filters are not part of saved-search
+matching.
 
 For example, these read-only checks can be run in the Supabase SQL Editor after
 the migrations:
@@ -301,6 +317,18 @@ unauthorized-access checks:
   including before the scheduled cleanup has run. After the cleanup job runs,
   confirm expired conversation/message rows are deleted and active-auction
   messages remain.
+- After applying 016 and 017 in a test project, save searches under two buyer
+  accounts and confirm each account can read and edit only its own searches.
+  Try empty criteria, invalid prices, and equivalent duplicate searches.
+- Publish auctions that match and do not match the saved criteria. Verify
+  case-insensitive literal keywords, exact category, the starting-price
+  boundary, seller exclusion, and no alerts for expired or cancelled listings.
+  Confirm multiple matching searches create distinct alerts and repeated
+  publication processing does not duplicate them.
+- Confirm each saved-search notification appears for its recipient and opens
+  the linked auction. Delete a saved search and verify existing notifications
+  remain readable. Confirm logged-out users can still browse but cannot save
+  or access private saved searches.
 - Approve and reject results. Confirm contact email is unavailable before
   approval and only available to the seller and confirmed winning bidder after
   approval.

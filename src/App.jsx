@@ -43,6 +43,62 @@ function money(amount) {
   return `₹${Number(amount).toLocaleString("en-IN")}`;
 }
 
+function getSavedSearchLabel(savedSearch) {
+  const criteria = [
+    savedSearch.keywords,
+    savedSearch.category,
+    savedSearch.max_price == null
+      ? null
+      : `up to ${money(savedSearch.max_price)} starting price`,
+  ].filter(Boolean);
+
+  return criteria.join(" · ");
+}
+
+function normalizeSavedSearchDraft(draft) {
+  const keywords = String(draft.keywords || "").trim();
+  const category =
+    draft.category && draft.category !== "All" ? draft.category : null;
+  const maxPriceInput = String(draft.maxPrice || "").trim();
+
+  if (keywords.length > 200) {
+    return { error: "Keywords must be 200 characters or fewer." };
+  }
+  if (category && !categories.includes(category)) {
+    return { error: "Choose a valid category." };
+  }
+
+  let maxPrice = null;
+  if (maxPriceInput) {
+    if (!/^\d+(?:\.\d{1,2})?$/.test(maxPriceInput)) {
+      return { error: "Enter a valid maximum starting price." };
+    }
+
+    maxPrice = Number(maxPriceInput);
+    if (
+      !Number.isFinite(maxPrice) ||
+      maxPrice <= 0 ||
+      maxPrice > 9999999999.99
+    ) {
+      return { error: "Maximum starting price must be greater than zero." };
+    }
+  }
+
+  if (!keywords && !category && maxPrice === null) {
+    return {
+      error: "Add keywords, choose a category, or enter a maximum price.",
+    };
+  }
+
+  return {
+    values: {
+      keywords: keywords || null,
+      category,
+      max_price: maxPrice,
+    },
+  };
+}
+
 function leadingBid(item) {
   return item.bids.length
     ? Math.max(...item.bids.map((bid) => bid.amount))
@@ -325,6 +381,15 @@ function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationActionBusy, setNotificationActionBusy] = useState(false);
   const [notificationRefresh, setNotificationRefresh] = useState(0);
+  const [savedSearches, setSavedSearches] = useState([]);
+  const [savedSearchesOwnerId, setSavedSearchesOwnerId] = useState(null);
+  const [savedSearchesLoading, setSavedSearchesLoading] = useState(false);
+  const [savedSearchesError, setSavedSearchesError] = useState("");
+  const [savedSearchesErrorOwnerId, setSavedSearchesErrorOwnerId] =
+    useState(null);
+  const [savedSearchRefresh, setSavedSearchRefresh] = useState(0);
+  const [savedSearchBusyId, setSavedSearchBusyId] = useState(null);
+  const [savedSearchEditor, setSavedSearchEditor] = useState(null);
   const [chatConversations, setChatConversations] = useState([]);
   const [chatConversationsLoading, setChatConversationsLoading] = useState(false);
   const [chatConversationId, setChatConversationId] = useState(null);
@@ -576,6 +641,46 @@ function App() {
       clearInterval(interval);
     };
   }, [currentUserId, notificationRefresh]);
+
+  useEffect(() => {
+    let active = true;
+
+    if (!currentUserId) return undefined;
+
+    async function loadSavedSearches() {
+      setSavedSearchesLoading(true);
+      setSavedSearchesError("");
+      setSavedSearchesErrorOwnerId(null);
+
+      try {
+        const { data, error } = await supabase
+          .from("saved_searches")
+          .select("id, keywords, category, max_price, created_at")
+          .eq("user_id", currentUserId)
+          .order("created_at", { ascending: false });
+
+        if (error) throw error;
+        if (!active) return;
+
+        setSavedSearches(data || []);
+        setSavedSearchesOwnerId(currentUserId);
+      } catch (error) {
+        if (!active) return;
+        console.error("Could not load saved searches.", error);
+        setSavedSearchesError(
+          "Saved searches could not be loaded. Please try again.",
+        );
+        setSavedSearchesErrorOwnerId(currentUserId);
+      } finally {
+        if (active) setSavedSearchesLoading(false);
+      }
+    }
+
+    void loadSavedSearches();
+    return () => {
+      active = false;
+    };
+  }, [currentUserId, savedSearchRefresh]);
 
   useEffect(() => {
     let active = true;
@@ -904,6 +1009,150 @@ function App() {
     setAuthIntent(intent);
     setAuthMode("signin");
     setPage("login");
+  }
+
+  async function saveCurrentSearch() {
+    if (!user) {
+      requestLogin("buy");
+      return;
+    }
+
+    const normalized = normalizeSavedSearchDraft({
+      keywords: search,
+      category,
+      maxPrice,
+    });
+    if (normalized.error) {
+      flash(normalized.error);
+      return;
+    }
+
+    setSavedSearchBusyId("create");
+    try {
+      const { data, error } = await supabase
+        .from("saved_searches")
+        .insert(normalized.values)
+        .select("id, keywords, category, max_price, created_at")
+        .single();
+
+      if (error) {
+        if (error.code === "23505") {
+          throw new Error("You already have an equivalent saved search.");
+        }
+        throw error;
+      }
+
+      setSavedSearches((previous) => [data, ...previous]);
+      setSavedSearchesOwnerId(user.id);
+      flash("Search saved. Matching new auctions will appear in notifications.");
+    } catch (error) {
+      console.error("Could not save search.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "This search could not be saved. Please try again.",
+      );
+    } finally {
+      setSavedSearchBusyId(null);
+    }
+  }
+
+  function editSavedSearch(savedSearch) {
+    setSavedSearchesError("");
+    setSavedSearchEditor({
+      id: savedSearch.id,
+      keywords: savedSearch.keywords || "",
+      category: savedSearch.category || "All",
+      maxPrice:
+        savedSearch.max_price == null ? "" : String(savedSearch.max_price),
+    });
+  }
+
+  async function updateSavedSearch(event) {
+    event.preventDefault();
+    if (!user || !savedSearchEditor) return;
+
+    const normalized = normalizeSavedSearchDraft(savedSearchEditor);
+    if (normalized.error) {
+      flash(normalized.error);
+      return;
+    }
+
+    const savedSearchId = savedSearchEditor.id;
+    setSavedSearchBusyId(savedSearchId);
+    try {
+      const { data, error } = await supabase
+        .from("saved_searches")
+        .update(normalized.values)
+        .eq("id", savedSearchId)
+        .eq("user_id", user.id)
+        .select("id, keywords, category, max_price, created_at")
+        .single();
+
+      if (error) {
+        if (error.code === "23505") {
+          throw new Error("You already have an equivalent saved search.");
+        }
+        throw error;
+      }
+
+      setSavedSearches((previous) =>
+        previous.map((entry) => (entry.id === data.id ? data : entry)),
+      );
+      setSavedSearchEditor(null);
+      flash("Saved search updated.");
+    } catch (error) {
+      console.error("Could not update saved search.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "This search could not be updated. Please try again.",
+      );
+    } finally {
+      setSavedSearchBusyId(null);
+    }
+  }
+
+  async function deleteSavedSearch(savedSearch) {
+    if (!user || savedSearchBusyId) return;
+    if (
+      !window.confirm(
+        `Delete the saved search "${getSavedSearchLabel(savedSearch)}"?`,
+      )
+    ) {
+      return;
+    }
+
+    setSavedSearchBusyId(savedSearch.id);
+    try {
+      const { data, error } = await supabase
+        .from("saved_searches")
+        .delete()
+        .eq("id", savedSearch.id)
+        .eq("user_id", user.id)
+        .select("id")
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) throw new Error("This saved search could not be found.");
+
+      setSavedSearches((previous) =>
+        previous.filter((entry) => entry.id !== savedSearch.id),
+      );
+      if (savedSearchEditor?.id === savedSearch.id) {
+        setSavedSearchEditor(null);
+      }
+      flash("Saved search deleted.");
+    } catch (error) {
+      console.error("Could not delete saved search.", error);
+      flash(
+        typeof error?.message === "string"
+          ? error.message
+          : "This search could not be deleted. Please try again.",
+      );
+    } finally {
+      setSavedSearchBusyId(null);
+    }
   }
 
   async function handleAuth(event) {
@@ -1813,6 +2062,10 @@ function App() {
     notificationsOwnerId === currentUserId ? notifications : [];
   const userNotificationsError =
     notificationsErrorOwnerId === currentUserId ? notificationsError : "";
+  const userSavedSearches =
+    savedSearchesOwnerId === currentUserId ? savedSearches : [];
+  const userSavedSearchesError =
+    savedSearchesErrorOwnerId === currentUserId ? savedSearchesError : "";
   const unreadNotificationCount = userNotifications.filter(
     (notification) => !notification.is_read,
   ).length;
@@ -1929,6 +2182,8 @@ function App() {
                                     ? "View result and contacts"
                                     : notification.notification_type === "auction_chat_message"
                                       ? "Open chat"
+                                      : notification.notification_type === "saved_search_match"
+                                        ? "View matching auction"
                                       : "View auction"}
                               </button>
                             )}
@@ -1952,6 +2207,9 @@ function App() {
                 )}
               </div>
               <NavButton onClick={() => go("my-listings")}>My listings</NavButton>
+              <NavButton onClick={() => go("saved-searches")}>
+                Saved searches
+              </NavButton>
               <NavButton className="nav-login" onClick={handleLogout}>
                 Sign out
               </NavButton>
@@ -2100,6 +2358,7 @@ function App() {
                 min="0"
                 className="price-filter"
                 placeholder="Max ₹"
+                aria-label="Maximum current bid"
                 value={maxPrice}
                 onChange={(event) => setMaxPrice(event.target.value)}
               />
@@ -2111,6 +2370,23 @@ function App() {
                 />
                 Closing in 1 hour
               </label>
+            </div>
+
+            <div className="save-search-row">
+              <p>
+                Alerts use keywords, category, and maximum starting price.
+                Condition and closing-time filters are not included.
+              </p>
+              <button
+                className="secondary-button save-search-button"
+                type="button"
+                disabled={Boolean(savedSearchBusyId)}
+                onClick={saveCurrentSearch}
+              >
+                {savedSearchBusyId === "create"
+                  ? "Saving search..."
+                  : "Save this search"}
+              </button>
             </div>
 
             <p className="results-count">
@@ -2138,6 +2414,190 @@ function App() {
                 <span>🔎</span>
                 <h3>No active auctions match</h3>
                 <p>Try changing your search or filters.</p>
+              </div>
+            )}
+          </section>
+        )}
+
+        {page === "saved-searches" && (
+          <section className="page-section saved-searches-page">
+            <div className="section-heading">
+              <div>
+                <span className="eyebrow">PERSONALIZED AUCTION ALERTS</span>
+                <h1>Saved searches</h1>
+                <p className="subheading">
+                  Get a notification when a newly published auction matches.
+                </p>
+              </div>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => go("browse")}
+              >
+                Browse auctions
+              </button>
+            </div>
+
+            {!user ? (
+              <div className="empty-state">
+                <h3>Sign in to view saved searches</h3>
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => requestLogin("buy")}
+                >
+                  Sign in →
+                </button>
+              </div>
+            ) : savedSearchesLoading && userSavedSearches.length === 0 ? (
+              <p className="saved-search-status" role="status">
+                Loading saved searches...
+              </p>
+            ) : userSavedSearchesError ? (
+              <div className="empty-state" role="alert">
+                <h3>Saved searches are unavailable</h3>
+                <p>{userSavedSearchesError}</p>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() =>
+                    setSavedSearchRefresh((refresh) => refresh + 1)
+                  }
+                >
+                  Try again
+                </button>
+              </div>
+            ) : userSavedSearches.length === 0 ? (
+              <div className="empty-state">
+                <span>🔔</span>
+                <h3>You have no saved searches yet</h3>
+                <p>
+                  Search the marketplace, choose keywords or filters, then save
+                  them to get alerts for matching new auctions.
+                </p>
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => go("browse")}
+                >
+                  Find an item →
+                </button>
+              </div>
+            ) : (
+              <div className="saved-search-list">
+                {userSavedSearches.map((savedSearch) => (
+                  <article className="saved-search-card" key={savedSearch.id}>
+                    {savedSearchEditor?.id === savedSearch.id ? (
+                      <form
+                        className="listing-form saved-search-editor"
+                        onSubmit={updateSavedSearch}
+                      >
+                        <label>
+                          Keywords
+                          <input
+                            type="search"
+                            maxLength="200"
+                            value={savedSearchEditor.keywords}
+                            onChange={(event) =>
+                              setSavedSearchEditor((previous) => ({
+                                ...previous,
+                                keywords: event.target.value,
+                              }))
+                            }
+                            placeholder="e.g. scientific calculator"
+                          />
+                        </label>
+                        <div className="form-row">
+                          <label>
+                            Category
+                            <select
+                              value={savedSearchEditor.category}
+                              onChange={(event) =>
+                                setSavedSearchEditor((previous) => ({
+                                  ...previous,
+                                  category: event.target.value,
+                                }))
+                              }
+                            >
+                              {categories.map((name) => (
+                                <option key={name} value={name}>
+                                  {name === "All" ? "Any category" : name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Maximum starting price (₹)
+                            <input
+                              type="number"
+                              min="0.01"
+                              max="9999999999.99"
+                              step="0.01"
+                              value={savedSearchEditor.maxPrice}
+                              onChange={(event) =>
+                                setSavedSearchEditor((previous) => ({
+                                  ...previous,
+                                  maxPrice: event.target.value,
+                                }))
+                              }
+                              placeholder="No limit"
+                            />
+                          </label>
+                        </div>
+                        <div className="saved-search-actions">
+                          <button
+                            className="primary-button"
+                            type="submit"
+                            disabled={Boolean(savedSearchBusyId)}
+                          >
+                            {savedSearchBusyId === savedSearch.id
+                              ? "Saving..."
+                              : "Save changes"}
+                          </button>
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            disabled={Boolean(savedSearchBusyId)}
+                            onClick={() => setSavedSearchEditor(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </form>
+                    ) : (
+                      <>
+                        <div className="saved-search-details">
+                          <span className="eyebrow">SEARCH ALERT</span>
+                          <h2>{getSavedSearchLabel(savedSearch)}</h2>
+                          <p>
+                            Matching checks use auction title, description,
+                            category, and starting price.
+                          </p>
+                        </div>
+                        <div className="saved-search-actions">
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            disabled={Boolean(savedSearchBusyId)}
+                            onClick={() => editSavedSearch(savedSearch)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            className="cancel-listing-button"
+                            type="button"
+                            disabled={Boolean(savedSearchBusyId)}
+                            onClick={() => deleteSavedSearch(savedSearch)}
+                          >
+                            {savedSearchBusyId === savedSearch.id
+                              ? "Deleting..."
+                              : "Delete"}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </article>
+                ))}
               </div>
             )}
           </section>
